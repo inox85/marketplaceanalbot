@@ -29,6 +29,7 @@ TELEGRAM_BOT_TOKEN = "8229344375:AAGCQAHkjzDL3YIyaP2-Em89jotb3eUblzs"
 TELEGRAM_CHAT_ID = "197595708"
 
 KEYWORDS = []
+BAD_KEYWORDS = []
 
 GROUPS = {}
 
@@ -261,6 +262,13 @@ def contains_keyword(text):
             return keyword
     return None
 
+def contains_bad_keyword(text):
+    """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
+    text_lower = text.lower()
+    for keyword in BAD_KEYWORDS:
+        if keyword.lower() in text_lower:
+            return keyword
+    return None
 
 def extract_post_url(container):
     hrefs = []
@@ -362,8 +370,14 @@ def send_telegram_message(text):
 
 def process_top_post(top_post, alerted_posts):
     keyword = contains_keyword(top_post["text"])
+    bad_keyword = contains_bad_keyword(top_post["text"])
 
     if not keyword:
+        print("Nessuna keyword trovata!")
+        return False
+    
+    if bad_keyword:
+        print("Trovata keyword non desiderata!")
         return False
 
     if top_post["id"] in alerted_posts:
@@ -433,8 +447,13 @@ def select_new_posts(driver):
 
 def reload_keywords():
     global KEYWORDS
+    global BAD_KEYWORDS
+
     with open("keywords.json", encoding="utf-8") as f:
         KEYWORDS = json.load(f)
+
+    with open("bad_keywords.json", encoding="utf-8") as f:
+        BAD_KEYWORDS = json.load(f)
 
 
 def main():
