@@ -497,7 +497,7 @@ def main():
 
         print()
         print("Se necessario, effettua il login a Facebook.")
-        time.sleep(60)
+        time.sleep(10)
 
         print()
         print("Monitoraggio avviato.")
