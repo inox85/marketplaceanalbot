@@ -452,11 +452,20 @@ def main():
     alerted_posts = load_alerted_posts()
     print(f"Post già segnalati in sessioni precedenti: {len(alerted_posts)}")
 
-    options = Options() 
-    options.add_argument(f"--user-data-dir={CHROME_PROFILE}")
-    options.add_argument("--start-maximized")
+    options = Options()
 
-    driver = webdriver.Chrome(options=options)
+    options.binary_location = "/usr/bin/chromium"
+
+    options.add_argument(
+        f"--user-data-dir={CHROME_PROFILE}"
+    )
+
+    service = Service("/usr/bin/chromedriver")
+
+    driver = webdriver.Chrome(
+        service=service,
+        options=options
+    )
 
     last_seen_ids = {g["url"]: None for g in GROUPS}
 
