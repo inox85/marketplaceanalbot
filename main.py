@@ -542,7 +542,11 @@ def main():
                 except Exception as e:
                     print(f"Errore durante il controllo di {group_name}:", e)
 
-            time.sleep(CHECK_INTERVAL)
+
+            for i in range(CHECK_INTERVAL):
+                print(".", end="", flush=True)
+                time.sleep(1)
+           
 
     except KeyboardInterrupt:
         print("\nMonitoraggio terminato.")
