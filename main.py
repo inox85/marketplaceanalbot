@@ -416,24 +416,60 @@ def process_top_post(top_post, alerted_posts):
 
 
 def select_new_posts(driver):
+    """
+    Apre il menu di ordinamento del gruppo e seleziona "Nuovi post",
+    come fallback nel caso il parametro sorting_setting nell'URL non
+    venga applicato da Facebook (capita, non è affidabile al 100%).
+
+    Il pulsante che apre il menu può mostrare etichette diverse a
+    seconda di cosa è attualmente selezionato (es. "Più pertinenti" è
+    il default se non è mai stato cambiato), quindi ne controlliamo
+    diverse varianti invece di una sola.
+    """
+    SORT_BUTTON_HINTS = [
+        "pertinenti", "rilevanti", "recenti", "recente",
+        "cronologico", "attività", "post più",
+    ]
+    SORT_OPTION_HINTS = [
+        "nuovi post", "più recenti", "data di pubblicazione",
+    ]
+
     buttons = driver.find_elements(By.XPATH, "//div[@role='button']")
     for button in buttons:
         try:
             text = button.text.strip().lower()
-            if "recent" in text or "recenti" in text or "cronologico" in text:
+            if any(hint in text for hint in SORT_BUTTON_HINTS):
                 button.click()
                 time.sleep(1)
                 break
         except Exception:
             continue
 
-    options = driver.find_elements(By.XPATH, "//*[contains(text(), 'Nuovi post')]")
-    for option in options:
+    # Prima proviamo con il ruolo tipico delle voci di menu di Facebook
+    menu_items = driver.find_elements(By.XPATH, "//div[@role='menuitem']")
+    for item in menu_items:
         try:
-            if option.is_displayed():
-                option.click()
+            text = item.text.strip().lower()
+            # testo corto: evitiamo di intercettare per sbaglio un
+            # contenitore enorme che contiene la frase incidentalmente
+            if text and len(text) < 60 and any(hint in text for hint in SORT_OPTION_HINTS) and item.is_displayed():
+                item.click()
                 time.sleep(3)
-                print("Ordinamento impostato su: Nuovi post")
+                print("  Ordinamento impostato su: Nuovi post")
+                return True
+        except Exception:
+            continue
+
+    # Fallback: cerca span/testo brevi con l'etichetta, se il menu non
+    # usa role="menuitem"
+    candidates = driver.find_elements(By.XPATH, "//span")
+    for el in candidates:
+        try:
+            text = el.text.strip().lower()
+            if text and len(text) < 60 and any(hint in text for hint in SORT_OPTION_HINTS) and el.is_displayed():
+                el.click()
+                time.sleep(3)
+                print("  Ordinamento impostato su: Nuovi post")
                 return True
         except Exception:
             continue
@@ -494,6 +530,7 @@ def main():
         print(f"\nApro il primo gruppo ({first_group['name']}) per il login...")
         driver.get(build_group_url(first_group["url"]))
         time.sleep(5)
+        select_new_posts(driver)
 
         print()
         print("Se necessario, effettua il login a Facebook.")
@@ -517,6 +554,7 @@ def main():
                 try:
                     driver.get(build_group_url(group_url))
                     time.sleep(5)
+                    select_new_posts(driver)
 
                     top_post = get_top_post(driver, group_name, group_url)
 
@@ -542,7 +580,8 @@ def main():
                 except Exception as e:
                     print(f"Errore durante il controllo di {group_name}:", e)
 
-
+            print("Fine ciclo completo.")
+            
             for i in range(CHECK_INTERVAL):
                 print(".", end="", flush=True)
                 time.sleep(1)
