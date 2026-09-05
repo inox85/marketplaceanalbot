@@ -580,10 +580,10 @@ def main():
                 except Exception as e:
                     print(f"Errore durante il controllo di {group_name}:", e)
 
-            print("Fine ciclo gruppi completato")
+            print("Fine ciclo completo.")
             
             for i in range(CHECK_INTERVAL):
-                print(i)
+                print(f"{i}/{CHECK_INTERVAL}", end="", flush=True)
                 time.sleep(1)
            
 
