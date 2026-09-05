@@ -13,6 +13,10 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import random
+import time
 
 print("Configuro encoding...")
 if sys.platform == "win32":
@@ -553,7 +557,13 @@ def main():
 
                 try:
                     driver.get(build_group_url(group_url))
-                    time.sleep(5)
+                     # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
+                    WebDriverWait(driver, timeout).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, POST_SELECTOR))
+                    )
+
+                    # piccola pausa casuale, non per aspettare il caricamento ma per stealth
+                    time.sleep(random.uniform(0.1, 1))
                     #select_new_posts(driver)
 
                     top_post = get_top_post(driver, group_name, group_url)
