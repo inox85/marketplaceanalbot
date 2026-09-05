@@ -37,7 +37,7 @@ with open('groups.json') as f:
     GROUPS = json.load(f)
 
 
-CHECK_INTERVAL = 30  # secondi di pausa tra un ciclo completo e il successivo
+CHECK_INTERVAL = 1  # secondi di pausa tra un ciclo completo e il successivo
 
 CHROME_PROFILE = Path.cwd() / "chrome_profile"
 
