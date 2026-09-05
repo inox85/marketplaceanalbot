@@ -554,7 +554,7 @@ def main():
                 try:
                     driver.get(build_group_url(group_url))
                     time.sleep(5)
-                    select_new_posts(driver)
+                    #select_new_posts(driver)
 
                     top_post = get_top_post(driver, group_name, group_url)
 
