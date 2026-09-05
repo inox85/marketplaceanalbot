@@ -31,6 +31,7 @@ if sys.platform == "win32":
 
 TELEGRAM_BOT_TOKEN = "8229344375:AAGCQAHkjzDL3YIyaP2-Em89jotb3eUblzs"
 TELEGRAM_CHAT_ID = "197595708"
+POST_SELECTOR = 'div[aria-posinset="1"]'  # <-- verifica che sia il selettore giusto, vedi sotto
 
 KEYWORDS = []
 BAD_KEYWORDS = []
@@ -534,7 +535,7 @@ def main():
         print(f"\nApro il primo gruppo ({first_group['name']}) per il login...")
         driver.get(build_group_url(first_group["url"]))
         time.sleep(5)
-        select_new_posts(driver)
+        #select_new_posts(driver)
 
         print()
         print("Se necessario, effettua il login a Facebook.")
@@ -558,7 +559,7 @@ def main():
                 try:
                     driver.get(build_group_url(group_url))
                      # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-                    WebDriverWait(driver, timeout).until(
+                    WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, POST_SELECTOR))
                     )
 
