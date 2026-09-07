@@ -61,6 +61,9 @@ with open('groups.json') as f:
 
 CHECK_INTERVAL = 1  # secondi di pausa tra un ciclo completo e il successivo
 
+GROUP_CHECK_RETRIES = 3  # tentativi per il controllo di un singolo gruppo prima di rinunciare
+GROUP_CHECK_RETRY_DELAY = 3  # secondi di pausa tra un tentativo e il successivo
+
 POST_SELECTOR = 'div[aria-posinset="1"]'
 
 CHROME_PROFILE = Path.cwd() / "chrome_profile"
@@ -782,40 +785,51 @@ def main():
                 group_name = group["name"]
                 group_url = group["url"]
 
-                try:
-                    driver.get(build_group_url(group_url))
-                     # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, POST_SELECTOR))
-                    )
+                top_post = None
+                for attempt in range(1, GROUP_CHECK_RETRIES + 1):
+                    try:
+                        driver.get(build_group_url(group_url))
+                         # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
+                        WebDriverWait(driver, 10).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, POST_SELECTOR))
+                        )
 
-                    # piccola pausa casuale, non per aspettare il caricamento ma per stealth
-                    time.sleep(random.uniform(0.1, 1))
-                    #select_new_posts(driver)
+                        # piccola pausa casuale, non per aspettare il caricamento ma per stealth
+                        time.sleep(random.uniform(0.1, 1))
+                        #select_new_posts(driver)
 
-                    top_post = get_top_post(driver, group_name, group_url)
+                        top_post = get_top_post(driver, group_name, group_url)
+                        break
 
-                    print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
+                    except KeyboardInterrupt:
+                        raise
 
-                    if top_post is None:
-                        continue
+                    except Exception as e:
+                        print(
+                            f"  Tentativo {attempt}/{GROUP_CHECK_RETRIES} fallito per "
+                            f"{group_name}: {type(e).__name__}: {e}"
+                        )
+                        if attempt < GROUP_CHECK_RETRIES:
+                            time.sleep(GROUP_CHECK_RETRY_DELAY)
+                else:
+                    print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
+                    continue
 
-                    print(f"  Testo estratto: {top_post['text'][:200]!r}")
-                    if top_post["author"]:
-                        print(f"  Autore: {top_post['author']!r}")
+                print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
 
-                    if top_post["id"] == last_seen_ids[group_url]:
-                        continue
+                if top_post is None:
+                    continue
 
-                    last_seen_ids[group_url] = top_post["id"]
+                print(f"  Testo estratto: {top_post['text'][:200]!r}")
+                if top_post["author"]:
+                    print(f"  Autore: {top_post['author']!r}")
 
-                    process_top_post(top_post, alerted_posts, chats)
+                if top_post["id"] == last_seen_ids[group_url]:
+                    continue
 
-                except KeyboardInterrupt:
-                    raise
+                last_seen_ids[group_url] = top_post["id"]
 
-                except Exception as e:
-                    print(f"Errore durante il controllo di {group_name}:", e)
+                process_top_post(top_post, alerted_posts, chats)
 
             print("Fine ciclo completo.")
             
