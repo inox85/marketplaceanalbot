@@ -26,10 +26,9 @@ if sys.platform == "win32":
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = "8229344375:AAGCQAHkjzDL3YIyaP2-Em89jotb3eUblzs"
-TELEGRAM_CHAT_ID = "197595708"
 
-KEYWORDS = []
-BAD_KEYWORDS = []
+KEYWORDS = []  # parole chiave di default assegnate a chi si iscrive con /subscribe
+BAD_KEYWORDS = []  # parole che sopprimono l'alert, condivise da tutte le chat
 
 GROUPS = {}
 
@@ -42,6 +41,9 @@ CHECK_INTERVAL = 30  # secondi di pausa tra un ciclo completo e il successivo
 CHROME_PROFILE = Path.cwd() / "chrome_profile"
 
 ALERTED_POSTS_FILE = Path.cwd() / "alerted_posts.json"
+CHATS_FILE = Path.cwd() / "chats.json"
+
+LAST_UPDATE_ID = None  # avanza ad ogni comando Telegram letto, per non rileggerlo
 
 
 # ============================================================
@@ -78,6 +80,30 @@ def save_alerted_posts(alerted_posts):
             json.dump(sorted(alerted_posts), f, ensure_ascii=False, indent=2)
     except Exception as e:
         print("Impossibile salvare", ALERTED_POSTS_FILE, "->", e)
+
+
+# ============================================================
+# GESTIONE CHAT ISCRITTE E LORO PAROLE CHIAVE
+# ============================================================
+
+def load_chats():
+    """Carica da disco le chat iscritte, ciascuna con le proprie parole chiave."""
+    if CHATS_FILE.exists():
+        try:
+            with open(CHATS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print("Impossibile leggere", CHATS_FILE, "->", e)
+    return {}
+
+
+def save_chats(chats):
+    """Salva su disco le chat iscritte e le loro parole chiave."""
+    try:
+        with open(CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(chats, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Impossibile salvare", CHATS_FILE, "->", e)
 
 
 # ============================================================
@@ -254,10 +280,10 @@ def clean_description(body):
     return body if body else None
 
 
-def contains_keyword(text):
+def contains_keyword(text, keywords):
     """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
     text_lower = text.lower()
-    for keyword in KEYWORDS:
+    for keyword in keywords:
         if keyword.lower() in text_lower:
             return keyword
     return None
@@ -346,9 +372,9 @@ def get_top_post(driver, group_name, group_url):
     }
 
 
-def send_telegram_message(text):
+def send_telegram_message(text, chat_id):
     if not TELEGRAM_BOT_TOKEN or "INSERISCI_QUI" in TELEGRAM_BOT_TOKEN:
-        print("  (Telegram non configurato: imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID)")
+        print("  (Telegram non configurato: imposta TELEGRAM_BOT_TOKEN)")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -356,63 +382,184 @@ def send_telegram_message(text):
         response = requests.post(
             url,
             data={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": False,
             },
             timeout=10
         )
         if response.status_code != 200:
-            print(f"  Errore invio Telegram: {response.status_code} - {response.text}")
+            print(f"  Errore invio Telegram ({chat_id}): {response.status_code} - {response.text}")
     except Exception as e:
         print("  Errore invio Telegram:", e)
 
 
-def process_top_post(top_post, alerted_posts):
-    keyword = contains_keyword(top_post["text"])
-    bad_keyword = contains_bad_keyword(top_post["text"])
-
-    if not keyword:
-        print("Nessuna keyword trovata!")
-        return False
-    
-    if bad_keyword:
+def process_top_post(top_post, alerted_posts, chats):
+    """
+    A differenza delle parole chiave (una lista per ogni chat, vedi
+    `chats`), le "bad keyword" restano condivise da tutte le chat: se
+    una compare nel testo, nessuna chat viene avvisata per quel post.
+    """
+    if contains_bad_keyword(top_post["text"]):
         print("Trovata keyword non desiderata!")
         return False
 
-    if top_post["id"] in alerted_posts:
-        return False
+    matched = False
 
-    alerted_posts.add(top_post["id"])
-    save_alerted_posts(alerted_posts)
+    for chat_id, chat_data in chats.items():
+        keyword = contains_keyword(top_post["text"], chat_data.get("keywords", []))
+        if not keyword:
+            continue
 
-    print()
-    print("=" * 60)
-    print("🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨")
-    print("Gruppo:", top_post["group_name"])
-    print("Parola:", keyword)
-    if top_post["author"]:
-        print("Autore:", top_post["author"])
-    print("-" * 60)
-    print(top_post["text"][:1000])
-    print("=" * 60)
-    print()
+        alert_key = f"{chat_id}|{top_post['id']}"
+        if alert_key in alerted_posts:
+            continue
 
-    message_lines = [
-        "🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨",
-        f"Gruppo: {top_post['group_name']}",
-        f"Parola: {keyword}",
-    ]
-    if top_post["author"]:
-        message_lines.append(f"Autore: {top_post['author']}")
-    message_lines.append("")
-    message_lines.append(top_post["text"][:1000])
-    message_lines.append("")
-    message_lines.append(top_post["url"] or top_post["group_url"])
+        alerted_posts.add(alert_key)
+        save_alerted_posts(alerted_posts)
+        matched = True
 
-    send_telegram_message("\n".join(message_lines))
+        print()
+        print("=" * 60)
+        print("🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨")
+        print("Chat:", chat_id)
+        print("Gruppo:", top_post["group_name"])
+        print("Parola:", keyword)
+        if top_post["author"]:
+            print("Autore:", top_post["author"])
+        print("-" * 60)
+        print(top_post["text"][:1000])
+        print("=" * 60)
+        print()
 
-    return True
+        message_lines = [
+            "🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨",
+            f"Gruppo: {top_post['group_name']}",
+            f"Parola: {keyword}",
+        ]
+        if top_post["author"]:
+            message_lines.append(f"Autore: {top_post['author']}")
+        message_lines.append("")
+        message_lines.append(top_post["text"][:1000])
+        message_lines.append("")
+        message_lines.append(top_post["url"] or top_post["group_url"])
+
+        send_telegram_message("\n".join(message_lines), chat_id)
+
+    if not matched:
+        print("Nessuna keyword trovata!")
+
+    return matched
+
+
+# ============================================================
+# COMANDI TELEGRAM (/subscribe, /add, /remove)
+# ============================================================
+
+SUBSCRIBE_MESSAGE = (
+    "✅ Iscrizione completata!\n\n"
+    "Da ora riceverai un messaggio ogni volta che viene trovato un "
+    "annuncio che contiene una delle tue parole chiave.\n\n"
+    "Comandi disponibili:\n"
+    "/add <parola> - aggiunge una parola chiave da cercare\n"
+    "/remove <parola> - rimuove una parola chiave\n\n"
+    "Parole chiave di partenza:\n{keywords}"
+)
+
+
+def handle_subscribe(chat_id, chats):
+    if chat_id not in chats:
+        chats[chat_id] = {"keywords": list(KEYWORDS)}
+        save_chats(chats)
+
+    keywords_list = ", ".join(chats[chat_id]["keywords"]) or "(nessuna)"
+    send_telegram_message(SUBSCRIBE_MESSAGE.format(keywords=keywords_list), chat_id)
+
+
+def handle_add(chat_id, argument, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    parola = argument.strip().lower()
+    if not parola:
+        send_telegram_message("Uso: /add <parola>", chat_id)
+        return
+
+    keywords = chats[chat_id]["keywords"]
+    if any(k.lower() == parola for k in keywords):
+        send_telegram_message(f"'{parola}' è già tra le tue parole chiave.", chat_id)
+        return
+
+    keywords.append(parola)
+    save_chats(chats)
+    send_telegram_message(f"✅ Aggiunta parola chiave: '{parola}'", chat_id)
+
+
+def handle_remove(chat_id, argument, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    parola = argument.strip().lower()
+    if not parola:
+        send_telegram_message("Uso: /remove <parola>", chat_id)
+        return
+
+    keywords = chats[chat_id]["keywords"]
+    match = next((k for k in keywords if k.lower() == parola), None)
+    if not match:
+        send_telegram_message(f"'{parola}' non è tra le tue parole chiave.", chat_id)
+        return
+
+    keywords.remove(match)
+    save_chats(chats)
+    send_telegram_message(f"🗑️ Rimossa parola chiave: '{parola}'", chat_id)
+
+
+def get_telegram_updates(offset):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json().get("result", [])
+    except Exception as e:
+        print("  Errore lettura comandi Telegram:", e)
+        return []
+
+
+def process_telegram_commands(chats):
+    """Legge i comandi Telegram in sospeso e li applica alla relativa chat."""
+    global LAST_UPDATE_ID
+
+    offset = LAST_UPDATE_ID + 1 if LAST_UPDATE_ID is not None else None
+    updates = get_telegram_updates(offset)
+
+    for update in updates:
+        LAST_UPDATE_ID = update["update_id"]
+
+        message = update.get("message")
+        if not message or "text" not in message:
+            continue
+
+        chat_id = str(message["chat"]["id"])
+        text = message["text"].strip()
+        if not text.startswith("/"):
+            continue
+
+        parts = text.split(maxsplit=1)
+        command = parts[0].split("@")[0].lower()
+        argument = parts[1] if len(parts) > 1 else ""
+
+        if command == "/subscribe":
+            handle_subscribe(chat_id, chats)
+        elif command == "/add":
+            handle_add(chat_id, argument, chats)
+        elif command == "/remove":
+            handle_remove(chat_id, argument, chats)
 
 
 def select_new_posts(driver):
@@ -508,6 +655,9 @@ def main():
     alerted_posts = load_alerted_posts()
     print(f"Post già segnalati in sessioni precedenti: {len(alerted_posts)}")
 
+    chats = load_chats()
+    print(f"Chat iscritte: {len(chats)}")
+
     options = Options()
 
     options.binary_location = "/usr/bin/chromium"
@@ -545,7 +695,7 @@ def main():
         while True:
 
             reload_keywords()
-            print("Parole cercate:", ", ".join(KEYWORDS))
+            process_telegram_commands(chats)
 
             for group in GROUPS:
                 group_name = group["name"]
@@ -572,7 +722,7 @@ def main():
 
                     last_seen_ids[group_url] = top_post["id"]
 
-                    process_top_post(top_post, alerted_posts)
+                    process_top_post(top_post, alerted_posts, chats)
 
                 except KeyboardInterrupt:
                     raise
