@@ -1,2 +1,5 @@
 /chrome_profile
 /__pycache__
+/secrets.ini
+/chats.json
+secrets.ini

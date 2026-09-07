@@ -4,6 +4,7 @@ import time
 import re
 import json
 import unicodedata
+import configparser
 from pathlib import Path
 import psutil
 
@@ -23,12 +24,31 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-
 # ============================================================
 # CONFIGURAZIONE
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = "8229344375:AAGCQAHkjzDL3YIyaP2-Em89jotb3eUblzs"
+def load_telegram_token():
+    """
+    Il token va in secrets.ini (gitignored), non nel sorgente: un token
+    committato in un repo pubblico viene individuato e dirottato da bot
+    automatici nel giro di minuti (è già successo con il token precedente).
+    """
+    config = configparser.ConfigParser()
+    if not config.read("secrets.ini", encoding="utf-8"):
+        sys.exit(
+            "secrets.ini non trovato. Copia secrets.ini.example in secrets.ini "
+            "e inserisci il bot_token del tuo bot Telegram."
+        )
+
+    token = config.get("telegram", "bot_token", fallback="").strip()
+    if not token or "INSERISCI_QUI" in token:
+        sys.exit("Imposta un bot_token valido in secrets.ini prima di avviare il bot.")
+
+    return token
+
+
+TELEGRAM_BOT_TOKEN = load_telegram_token()
 
 KEYWORDS = []  # parole chiave di default assegnate a chi si iscrive con /subscribe
 BAD_KEYWORDS = []  # parole che sopprimono l'alert, condivise da tutte le chat
@@ -378,10 +398,6 @@ def get_top_post(driver, group_name, group_url):
 
 
 def send_telegram_message(text, chat_id):
-    if not TELEGRAM_BOT_TOKEN or "INSERISCI_QUI" in TELEGRAM_BOT_TOKEN:
-        print("  (Telegram non configurato: imposta TELEGRAM_BOT_TOKEN)")
-        return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         response = requests.post(
