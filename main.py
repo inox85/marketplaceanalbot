@@ -665,6 +665,7 @@ def main():
     options.add_argument(
         f"--user-data-dir={CHROME_PROFILE}"
     )
+    options.add_argument("--blink-settings=imagesEnabled=false")
 
     service = Service("/usr/bin/chromedriver")
 
