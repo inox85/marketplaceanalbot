@@ -681,19 +681,21 @@ def main():
 
     options = Options()
 
-    options.binary_location = "/usr/bin/chromium"
+    if sys.platform != "win32":
+        # Path fissi del Raspberry Pi: su Windows lasciamo che Selenium
+        # trovi da solo Chrome e il chromedriver giusto (Selenium Manager).
+        options.binary_location = "/usr/bin/chromium"
 
     options.add_argument(
         f"--user-data-dir={CHROME_PROFILE}"
     )
     options.add_argument("--blink-settings=imagesEnabled=false")
 
-    service = Service("/usr/bin/chromedriver")
-
-    driver = webdriver.Chrome(
-        service=service,
-        options=options
-    )
+    if sys.platform != "win32":
+        service = Service("/usr/bin/chromedriver")
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
 
     last_seen_ids = {g["url"]: None for g in GROUPS}
 
