@@ -445,7 +445,7 @@ def process_top_post(top_post, alerted_posts, chats):
 
         print()
         print("=" * 60)
-        print("🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨")
+        print(f"🚨 {str(keyword).upper()} 🚨")
         print("Chat:", chat_id)
         print("Gruppo:", top_post["group_name"])
         print("Parola:", keyword)
