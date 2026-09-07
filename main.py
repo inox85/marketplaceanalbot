@@ -457,7 +457,7 @@ def process_top_post(top_post, alerted_posts, chats):
         print()
 
         message_lines = [
-            "🚨🚨 NUOVO ANNUNCIO TROVATO 🚨🚨",
+            f"🚨 TROVATO: {str(keyword).upper()} 🚨",
             f"Gruppo: {top_post['group_name']}",
             f"Parola: {keyword}",
         ]
