@@ -483,7 +483,8 @@ SUBSCRIBE_MESSAGE = (
     "annuncio che contiene una delle tue parole chiave.\n\n"
     "Comandi disponibili:\n"
     "/add <parola> - aggiunge una parola chiave da cercare\n"
-    "/remove <parola> - rimuove una parola chiave\n\n"
+    "/remove <parola> - rimuove una parola chiave\n"
+    "/keywords - mostra le tue parole chiave\n\n"
     "Parole chiave di partenza:\n{keywords}"
 )
 
@@ -538,6 +539,40 @@ def handle_remove(chat_id, argument, chats):
     send_telegram_message(f"🗑️ Rimossa parola chiave: '{parola}'", chat_id)
 
 
+def handle_keywords(chat_id, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    keywords = chats[chat_id]["keywords"]
+    keywords_list = ", ".join(keywords) or "(nessuna)"
+    send_telegram_message(f"Le tue parole chiave:\n{keywords_list}", chat_id)
+
+
+TELEGRAM_COMMANDS = [
+    {"command": "subscribe", "description": "Iscrivi questa chat agli avvisi"},
+    {"command": "add", "description": "Aggiungi una parola chiave"},
+    {"command": "remove", "description": "Rimuovi una parola chiave"},
+    {"command": "keywords", "description": "Mostra le tue parole chiave"},
+]
+
+
+def register_telegram_commands():
+    """
+    Registra i comandi presso Telegram così che il client mostri il menu
+    di autocompletamento quando l'utente digita "/". Va rifatto solo
+    quando la lista cambia, ma richiamarlo ad ogni avvio non ha effetti
+    collaterali: Telegram sovrascrive semplicemente la lista precedente.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+    try:
+        response = requests.post(url, json={"commands": TELEGRAM_COMMANDS}, timeout=10)
+        if response.status_code != 200:
+            print(f"  Errore registrazione comandi Telegram: {response.status_code} - {response.text}")
+    except Exception as e:
+        print("  Errore registrazione comandi Telegram:", e)
+
+
 def get_telegram_updates(offset):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"timeout": 0}
@@ -581,6 +616,8 @@ def process_telegram_commands(chats):
             handle_add(chat_id, argument, chats)
         elif command == "/remove":
             handle_remove(chat_id, argument, chats)
+        elif command == "/keywords":
+            handle_keywords(chat_id, chats)
 
 
 def select_new_posts(driver):
@@ -678,6 +715,8 @@ def main():
 
     chats = load_chats()
     print(f"Chat iscritte: {len(chats)}")
+
+    register_telegram_commands()
 
     options = Options()
 
