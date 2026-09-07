@@ -41,7 +41,7 @@ def load_telegram_token():
             "e inserisci il bot_token del tuo bot Telegram."
         )
 
-    token = config.get("telegram", "bot_token", fallback="").strip()
+    token = config.get("telegram", "bot_token", fallback="").strip().strip("\"'")
     if not token or "INSERISCI_QUI" in token:
         sys.exit("Imposta un bot_token valido in secrets.ini prima di avviare il bot.")
 
@@ -696,6 +696,23 @@ def main():
         driver = webdriver.Chrome(service=service, options=options)
     else:
         driver = webdriver.Chrome(options=options)
+
+    try:
+        # Font e media non servono a estrarre il testo del post: li
+        # blocchiamo via CDP oltre alle immagini (già disattivate sopra)
+        # per alleggerire ulteriormente il caricamento. Non tocchiamo i
+        # CSS: senza stile, elementi che Facebook nasconde a video
+        # potrebbero risultare "visibili" nel DOM e sporcare il testo
+        # estratto da get_top_post().
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {
+            "urls": [
+                "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+                "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.avi", "*.mov",
+            ]
+        })
+    except Exception as e:
+        print("Impossibile impostare il blocco extra di font/media via CDP:", e)
 
     last_seen_ids = {g["url"]: None for g in GROUPS}
 
