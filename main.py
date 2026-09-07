@@ -804,9 +804,7 @@ def main():
                     try:
                         driver.get(build_group_url(group_url))
                          # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-                        WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, POST_SELECTOR))
-                        )
+                        #time.sleep(5)
 
                         # piccola pausa casuale, non per aspettare il caricamento ma per stealth
                         time.sleep(random.uniform(0.1, 1))
