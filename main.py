@@ -825,6 +825,14 @@ def main():
                         )
                         if attempt < GROUP_CHECK_RETRIES:
                             time.sleep(GROUP_CHECK_RETRY_DELAY)
+                            # forza un reload vero e proprio (non un semplice
+                            # driver.get sullo stesso URL) prima di ritentare,
+                            # nel caso la pagina sia rimasta bloccata in uno
+                            # stato non valido (es. checkpoint, spinner fisso)
+                            try:
+                                driver.refresh()
+                            except Exception:
+                                pass
                 else:
                     print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
                     continue
