@@ -487,7 +487,8 @@ SUBSCRIBE_MESSAGE = (
     "Comandi disponibili:\n"
     "/add <parola> - aggiunge una parola chiave da cercare\n"
     "/remove <parola> - rimuove una parola chiave\n"
-    "/keywords - mostra le tue parole chiave\n\n"
+    "/keywords - mostra le tue parole chiave\n"
+    "/clear - rimuove tutte le parole chiave\n\n"
     "Parole chiave di partenza:\n{keywords}"
 )
 
@@ -497,7 +498,7 @@ def handle_subscribe(chat_id, chats):
         chats[chat_id] = {"keywords": list(KEYWORDS)}
         save_chats(chats)
 
-    keywords_list = ", ".join(chats[chat_id]["keywords"]) or "(nessuna)"
+    keywords_list = ", ".join(sorted(chats[chat_id]["keywords"], key=str.lower)) or "(nessuna)"
     send_telegram_message(SUBSCRIBE_MESSAGE.format(keywords=keywords_list), chat_id)
 
 
@@ -548,8 +549,18 @@ def handle_keywords(chat_id, chats):
         return
 
     keywords = chats[chat_id]["keywords"]
-    keywords_list = ", ".join(keywords) or "(nessuna)"
+    keywords_list = ", ".join(sorted(keywords, key=str.lower)) or "(nessuna)"
     send_telegram_message(f"Le tue parole chiave:\n{keywords_list}", chat_id)
+
+
+def handle_clear(chat_id, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    chats[chat_id]["keywords"] = []
+    save_chats(chats)
+    send_telegram_message("🗑️ Tutte le parole chiave sono state rimosse.", chat_id)
 
 
 TELEGRAM_COMMANDS = [
@@ -557,6 +568,7 @@ TELEGRAM_COMMANDS = [
     {"command": "add", "description": "Aggiungi una parola chiave"},
     {"command": "remove", "description": "Rimuovi una parola chiave"},
     {"command": "keywords", "description": "Mostra le tue parole chiave"},
+    {"command": "clear", "description": "Rimuovi tutte le parole chiave"},
 ]
 
 
@@ -621,6 +633,8 @@ def process_telegram_commands(chats):
             handle_remove(chat_id, argument, chats)
         elif command == "/keywords":
             handle_keywords(chat_id, chats)
+        elif command == "/clear":
+            handle_clear(chat_id, chats)
 
 
 def select_new_posts(driver):
