@@ -719,9 +719,10 @@ def main():
         while True:
 
             reload_keywords()
-            process_telegram_commands(chats)
+            
 
             for group in GROUPS:
+                process_telegram_commands(chats)
                 group_name = group["name"]
                 group_url = group["url"]
 
