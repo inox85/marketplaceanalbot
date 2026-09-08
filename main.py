@@ -776,7 +776,7 @@ def main():
         first_group = GROUPS[0]
         print(f"\nApro il primo gruppo ({first_group['name']}) per il login...")
         driver.get(build_group_url(first_group["url"]))
-        time.sleep(5)
+        #time.sleep(5)
         #select_new_posts(driver)
 
         print()
