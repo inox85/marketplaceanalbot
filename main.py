@@ -68,6 +68,9 @@ GROUPS = [g for g in ALL_GROUPS if g.get("attivo", True)]
 GROUP_CHECK_RETRIES = 3  # tentativi per il controllo di un singolo gruppo prima di rinunciare
 GROUP_CHECK_RETRY_DELAY = 3  # secondi di pausa tra un tentativo e il successivo
 
+TOP_POST_TEXT_TIMEOUT = 5  # secondi massimi di attesa che il testo del post compaia dopo il caricamento
+TOP_POST_TEXT_POLL_INTERVAL = 0.5  # secondi tra un tentativo di lettura del testo e il successivo
+
 # Intervallo tra due controlli dello stesso gruppo: si restringe verso il
 # minimo quando il gruppo produce post nuovi (per essere tempestivi nella
 # prenotazione) e si allarga verso il massimo quando resta silenzioso, per
@@ -378,12 +381,23 @@ def get_top_post(driver, group_name, group_url):
         print(f"  [{group_name}] Nessun post con aria-posinset=1 trovato in questo giro.")
         return None
 
-    try:
-        raw_text = container.text.strip()
-    except Exception:
-        raw_text = ""
+    # Il testo può comparire con un attimo di ritardo rispetto alla presenza
+    # dell'elemento nel DOM (il post è già inserito, ma il contenuto testuale
+    # non ha ancora finito di renderizzare): riprova per qualche secondo
+    # prima di concludere che il post è genuinamente senza testo.
+    raw_text = ""
+    deadline = time.time() + TOP_POST_TEXT_TIMEOUT
+    while time.time() < deadline:
+        try:
+            raw_text = container.text.strip()
+        except Exception:
+            raw_text = ""
+        if raw_text:
+            break
+        time.sleep(TOP_POST_TEXT_POLL_INTERVAL)
 
     if not raw_text:
+        print(f"  [{group_name}] Post trovato ma senza testo dopo {TOP_POST_TEXT_TIMEOUT}s di attesa (probabile immagine/video senza didascalia).")
         return None
 
     text = clean_facebook_text(raw_text)
