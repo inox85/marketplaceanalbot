@@ -3,6 +3,7 @@ import os
 import time
 import re
 import json
+import heapq
 import unicodedata
 import configparser
 from pathlib import Path
@@ -59,10 +60,18 @@ with open('groups.json') as f:
     GROUPS = json.load(f)
 
 
-CHECK_INTERVAL = 1  # secondi di pausa tra un ciclo completo e il successivo
-
 GROUP_CHECK_RETRIES = 3  # tentativi per il controllo di un singolo gruppo prima di rinunciare
 GROUP_CHECK_RETRY_DELAY = 3  # secondi di pausa tra un tentativo e il successivo
+
+# Intervallo tra due controlli dello stesso gruppo: si restringe verso il
+# minimo quando il gruppo produce post nuovi (per essere tempestivi nella
+# prenotazione) e si allarga verso il massimo quando resta silenzioso, per
+# non sprecare cicli su gruppi poco attivi e concentrarsi su quelli attivi.
+GROUP_CHECK_MIN_INTERVAL = 3        # secondi minimi anche per un gruppo molto attivo
+GROUP_CHECK_MAX_INTERVAL = 90       # secondi massimi per un gruppo silenzioso
+GROUP_CHECK_DEFAULT_INTERVAL = 15   # intervallo di partenza, prima di sapere quanto è attivo
+GROUP_CHECK_SPEEDUP_FACTOR = 2      # riduzione dell'intervallo dopo un post nuovo
+GROUP_CHECK_SLOWDOWN_FACTOR = 1.3   # aumento dell'intervallo se non trova nulla di nuovo
 
 POST_SELECTOR = 'div[aria-posinset="1"]'
 
@@ -714,6 +723,68 @@ def reload_keywords():
         BAD_KEYWORDS = json.load(f)
 
 
+def check_group(driver, group, chats, alerted_posts, last_seen_ids):
+    """
+    Controlla un singolo gruppo (con retry) ed eventualmente processa il
+    nuovo post. Ritorna "new" se ha trovato un post diverso dall'ultimo
+    visto, "same" se non c'è nulla di nuovo, "failed" se tutti i tentativi
+    sono falliti: lo scheduler in main() usa questo esito per decidere se
+    controllare il gruppo più spesso o più di rado.
+    """
+    group_name = group["name"]
+    group_url = group["url"]
+
+    top_post = None
+    for attempt in range(1, GROUP_CHECK_RETRIES + 1):
+        try:
+            driver.get(build_group_url(group_url))
+            # piccola pausa casuale, non per aspettare il caricamento ma per stealth
+            time.sleep(random.uniform(0.1, 1))
+            #select_new_posts(driver)
+
+            top_post = get_top_post(driver, group_name, group_url)
+            break
+
+        except KeyboardInterrupt:
+            raise
+
+        except Exception as e:
+            print(
+                f"  Tentativo {attempt}/{GROUP_CHECK_RETRIES} fallito per "
+                f"{group_name}: {type(e).__name__}: {e}"
+            )
+            if attempt < GROUP_CHECK_RETRIES:
+                time.sleep(GROUP_CHECK_RETRY_DELAY)
+                # forza un reload vero e proprio (non un semplice
+                # driver.get sullo stesso URL) prima di ritentare,
+                # nel caso la pagina sia rimasta bloccata in uno
+                # stato non valido (es. checkpoint, spinner fisso)
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+    else:
+        print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
+        return "failed"
+
+    print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
+
+    if top_post is None:
+        return "same"
+
+    print(f"  Testo estratto: {top_post['text'][:200]!r}")
+    if top_post["author"]:
+        print(f"  Autore: {top_post['author']!r}")
+
+    if top_post["id"] == last_seen_ids[group_url]:
+        return "same"
+
+    last_seen_ids[group_url] = top_post["id"]
+
+    process_top_post(top_post, alerted_posts, chats)
+    return "new"
+
+
 def main():
     chiudi_chrome()
     if not GROUPS:
@@ -784,78 +855,50 @@ def main():
         time.sleep(10)
 
         print()
-        print("Monitoraggio avviato.")
-        print("Controllo ogni ciclo completo ogni", CHECK_INTERVAL, "secondi.")
-        print("Ad ogni giro esamino solo il post in cima al feed (posinset=1) di ogni gruppo.")
+        print("Monitoraggio avviato con intervallo adattivo per gruppo.")
+        print(f"Ogni gruppo parte da {GROUP_CHECK_DEFAULT_INTERVAL}s tra un controllo e il successivo:")
+        print(f"  si restringe fino a {GROUP_CHECK_MIN_INTERVAL}s se trova post nuovi di seguito,")
+        print(f"  si allarga fino a {GROUP_CHECK_MAX_INTERVAL}s se resta silenzioso.")
+        print("Ad ogni controllo esamino solo il post in cima al feed (posinset=1) del gruppo.")
         print()
+
+        groups_by_url = {g["url"]: g for g in GROUPS}
+        intervals = {g["url"]: GROUP_CHECK_DEFAULT_INTERVAL for g in GROUPS}
+        # coda di priorità (next_check_time, group_url): tutti i gruppi
+        # partono "dovuti" subito, poi ciascuno si ripianifica in base a
+        # quanto si è rivelato attivo.
+        schedule = [(time.time(), g["url"]) for g in GROUPS]
+        heapq.heapify(schedule)
 
         while True:
 
             reload_keywords()
-            
+            process_telegram_commands(chats)
 
-            for group in GROUPS:
-                process_telegram_commands(chats)
-                group_name = group["name"]
-                group_url = group["url"]
+            now = time.time()
+            next_time, group_url = schedule[0]
+            if next_time > now:
+                # nessun gruppo ancora dovuto: aspetta al massimo 1s per
+                # restare comunque reattivo ai comandi Telegram
+                time.sleep(min(next_time - now, 1))
+                continue
 
-                top_post = None
-                for attempt in range(1, GROUP_CHECK_RETRIES + 1):
-                    try:
-                        driver.get(build_group_url(group_url))
-                         # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-                        #time.sleep(5)
+            heapq.heappop(schedule)
+            group = groups_by_url[group_url]
 
-                        # piccola pausa casuale, non per aspettare il caricamento ma per stealth
-                        time.sleep(random.uniform(0.1, 1))
-                        #select_new_posts(driver)
+            result = check_group(driver, group, chats, alerted_posts, last_seen_ids)
 
-                        top_post = get_top_post(driver, group_name, group_url)
-                        break
+            interval = intervals[group_url]
+            if result == "new":
+                interval = max(GROUP_CHECK_MIN_INTERVAL, interval / GROUP_CHECK_SPEEDUP_FACTOR)
+                print(f"  -> {group['name']} attivo: prossimo controllo tra {interval:.0f}s")
+            elif result == "same":
+                interval = min(GROUP_CHECK_MAX_INTERVAL, interval * GROUP_CHECK_SLOWDOWN_FACTOR)
+            # "failed": lascia l'intervallo invariato, non è indicativo
+            # dell'attività del gruppo
 
-                    except KeyboardInterrupt:
-                        raise
-
-                    except Exception as e:
-                        print(
-                            f"  Tentativo {attempt}/{GROUP_CHECK_RETRIES} fallito per "
-                            f"{group_name}: {type(e).__name__}: {e}"
-                        )
-                        if attempt < GROUP_CHECK_RETRIES:
-                            time.sleep(GROUP_CHECK_RETRY_DELAY)
-                            # forza un reload vero e proprio (non un semplice
-                            # driver.get sullo stesso URL) prima di ritentare,
-                            # nel caso la pagina sia rimasta bloccata in uno
-                            # stato non valido (es. checkpoint, spinner fisso)
-                            try:
-                                driver.refresh()
-                            except Exception:
-                                pass
-                else:
-                    print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
-                    continue
-
-                print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
-
-                if top_post is None:
-                    continue
-
-                print(f"  Testo estratto: {top_post['text'][:200]!r}")
-                if top_post["author"]:
-                    print(f"  Autore: {top_post['author']!r}")
-
-                if top_post["id"] == last_seen_ids[group_url]:
-                    continue
-
-                last_seen_ids[group_url] = top_post["id"]
-
-                process_top_post(top_post, alerted_posts, chats)
-
-            print("Fine ciclo completo.")
-            
-            for i in range(CHECK_INTERVAL):
-                print(f"{i}/{CHECK_INTERVAL}", end="", flush=True)
-                time.sleep(1)
+            intervals[group_url] = interval
+            heapq.heappush(schedule, (time.time() + interval, group_url))
            
 
     except KeyboardInterrupt:
