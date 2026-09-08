@@ -3,6 +3,8 @@ import os
 import time
 import re
 import json
+import shutil
+import threading
 import unicodedata
 import configparser
 from pathlib import Path
@@ -63,6 +65,14 @@ CHECK_INTERVAL = 1  # secondi di pausa tra un ciclo completo e il successivo
 
 GROUP_CHECK_RETRIES = 3  # tentativi per il controllo di un singolo gruppo prima di rinunciare
 GROUP_CHECK_RETRY_DELAY = 3  # secondi di pausa tra un tentativo e il successivo
+
+WORKER_COUNT = 2  # numero di istanze Chrome che si dividono i gruppi da controllare
+
+# Protegge le strutture condivise tra i worker (alerted_posts, chats) e i
+# relativi salvataggi su disco, oltre alla lettura/scrittura dei comandi
+# Telegram: più worker/thread possono altrimenti scrivere sugli stessi file
+# JSON quasi contemporaneamente.
+STATE_LOCK = threading.Lock()
 
 POST_SELECTOR = 'div[aria-posinset="1"]'
 
@@ -461,6 +471,7 @@ def process_top_post(top_post, alerted_posts, chats):
             f"Gruppo: {top_post['group_name']}",
             f"Parola: {keyword}",
         ]
+        
         if top_post["author"]:
             message_lines.append(f"Autore: {top_post['author']}")
         message_lines.append("")
@@ -714,27 +725,21 @@ def reload_keywords():
         BAD_KEYWORDS = json.load(f)
 
 
-def main():
-    chiudi_chrome()
-    if not GROUPS:
-        print("Nessun gruppo configurato in GROUPS. Aggiungine almeno uno.")
-        return
+def clone_chrome_profile(worker_index):
+    """
+    Ogni istanza Chrome ha bisogno del proprio --user-data-dir: due processi
+    non possono condividere la stessa cartella profilo. Duplichiamo quindi il
+    profilo principale (già loggato su Facebook) una volta sola per ciascun
+    worker aggiuntivo, così partono già autenticati.
+    """
+    worker_profile = CHROME_PROFILE.parent / f"{CHROME_PROFILE.name}_worker{worker_index}"
+    if not worker_profile.exists():
+        print(f"Clono il profilo Chrome per il worker {worker_index}...")
+        shutil.copytree(CHROME_PROFILE, worker_profile)
+    return worker_profile
 
-    print("Avvio monitor Facebook multi-gruppo...")
-    print("Profilo Chrome:", CHROME_PROFILE)
 
-    print("Gruppi monitorati:")
-    for g in GROUPS:
-        print(f"  - {g['name']}: {g['url']}")
-
-    alerted_posts = load_alerted_posts()
-    print(f"Post già segnalati in sessioni precedenti: {len(alerted_posts)}")
-
-    chats = load_chats()
-    print(f"Chat iscritte: {len(chats)}")
-
-    register_telegram_commands()
-
+def build_driver(profile_dir):
     options = Options()
 
     if sys.platform != "win32":
@@ -742,9 +747,7 @@ def main():
         # trovi da solo Chrome e il chromedriver giusto (Selenium Manager).
         options.binary_location = "/usr/bin/chromium"
 
-    options.add_argument(
-        f"--user-data-dir={CHROME_PROFILE}"
-    )
+    options.add_argument(f"--user-data-dir={profile_dir}")
     options.add_argument("--blink-settings=imagesEnabled=false")
 
     if sys.platform != "win32":
@@ -770,6 +773,102 @@ def main():
     except Exception as e:
         print("Impossibile impostare il blocco extra di font/media via CDP:", e)
 
+    return driver
+
+
+def check_group(driver, group, chats, alerted_posts, last_seen_ids):
+    """Controlla un singolo gruppo (con retry) e processa l'eventuale nuovo post."""
+    group_name = group["name"]
+    group_url = group["url"]
+
+    top_post = None
+    for attempt in range(1, GROUP_CHECK_RETRIES + 1):
+        try:
+            driver.get(build_group_url(group_url))
+            # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
+            #time.sleep(5)
+
+            # piccola pausa casuale, non per aspettare il caricamento ma per stealth
+            time.sleep(random.uniform(0.1, 1))
+            #select_new_posts(driver)
+
+            top_post = get_top_post(driver, group_name, group_url)
+            break
+
+        except KeyboardInterrupt:
+            raise
+
+        except Exception as e:
+            print(
+                f"  Tentativo {attempt}/{GROUP_CHECK_RETRIES} fallito per "
+                f"{group_name}: {type(e).__name__}: {e}"
+            )
+            if attempt < GROUP_CHECK_RETRIES:
+                time.sleep(GROUP_CHECK_RETRY_DELAY)
+                # forza un reload vero e proprio (non un semplice
+                # driver.get sullo stesso URL) prima di ritentare,
+                # nel caso la pagina sia rimasta bloccata in uno
+                # stato non valido (es. checkpoint, spinner fisso)
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+    else:
+        print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
+        return
+
+    print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
+
+    if top_post is None:
+        return
+
+    print(f"  Testo estratto: {top_post['text'][:200]!r}")
+    if top_post["author"]:
+        print(f"  Autore: {top_post['author']!r}")
+
+    if top_post["id"] == last_seen_ids[group_url]:
+        return
+
+    last_seen_ids[group_url] = top_post["id"]
+
+    with STATE_LOCK:
+        process_top_post(top_post, alerted_posts, chats)
+
+
+def worker_loop(groups_subset, driver, chats, alerted_posts, last_seen_ids):
+    for group in groups_subset:
+        try:
+            check_group(driver, group, chats, alerted_posts, last_seen_ids)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"Errore inatteso nel worker sul gruppo {group['name']}:", e)
+
+
+def main():
+    chiudi_chrome()
+    if not GROUPS:
+        print("Nessun gruppo configurato in GROUPS. Aggiungine almeno uno.")
+        return
+
+    print("Avvio monitor Facebook multi-gruppo...")
+    print("Profilo Chrome:", CHROME_PROFILE)
+
+    print("Gruppi monitorati:")
+    for g in GROUPS:
+        print(f"  - {g['name']}: {g['url']}")
+
+    alerted_posts = load_alerted_posts()
+    print(f"Post già segnalati in sessioni precedenti: {len(alerted_posts)}")
+
+    chats = load_chats()
+    print(f"Chat iscritte: {len(chats)}")
+
+    register_telegram_commands()
+
+    driver = build_driver(CHROME_PROFILE)
+    drivers = [driver]
+
     last_seen_ids = {g["url"]: None for g in GROUPS}
 
     try:
@@ -783,8 +882,17 @@ def main():
         print("Se necessario, effettua il login a Facebook.")
         time.sleep(10)
 
+        # Ora che il profilo principale è loggato, lo duplichiamo per gli
+        # altri worker e apriamo le rispettive istanze Chrome.
+        worker_count = min(WORKER_COUNT, len(GROUPS))
+        for i in range(1, worker_count):
+            profile_dir = clone_chrome_profile(i)
+            drivers.append(build_driver(profile_dir))
+
+        group_chunks = [GROUPS[i::worker_count] for i in range(worker_count)]
+
         print()
-        print("Monitoraggio avviato.")
+        print(f"Monitoraggio avviato con {worker_count} worker.")
         print("Controllo ogni ciclo completo ogni", CHECK_INTERVAL, "secondi.")
         print("Ad ogni giro esamino solo il post in cima al feed (posinset=1) di ogni gruppo.")
         print()
@@ -792,77 +900,42 @@ def main():
         while True:
 
             reload_keywords()
-            
 
-            for group in GROUPS:
-                process_telegram_commands(chats)
-                group_name = group["name"]
-                group_url = group["url"]
+            threads = [
+                threading.Thread(
+                    target=worker_loop,
+                    args=(chunk, worker_driver, chats, alerted_posts, last_seen_ids),
+                )
+                for chunk, worker_driver in zip(group_chunks, drivers)
+            ]
 
-                top_post = None
-                for attempt in range(1, GROUP_CHECK_RETRIES + 1):
-                    try:
-                        driver.get(build_group_url(group_url))
-                         # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-                        #time.sleep(5)
+            for t in threads:
+                t.start()
 
-                        # piccola pausa casuale, non per aspettare il caricamento ma per stealth
-                        time.sleep(random.uniform(0.1, 1))
-                        #select_new_posts(driver)
+            # Nel frattempo, mentre i worker girano sui gruppi, continuiamo a
+            # leggere i comandi Telegram in sospeso senza aspettare la fine
+            # del ciclo completo.
+            while any(t.is_alive() for t in threads):
+                with STATE_LOCK:
+                    process_telegram_commands(chats)
+                time.sleep(1)
 
-                        top_post = get_top_post(driver, group_name, group_url)
-                        break
-
-                    except KeyboardInterrupt:
-                        raise
-
-                    except Exception as e:
-                        print(
-                            f"  Tentativo {attempt}/{GROUP_CHECK_RETRIES} fallito per "
-                            f"{group_name}: {type(e).__name__}: {e}"
-                        )
-                        if attempt < GROUP_CHECK_RETRIES:
-                            time.sleep(GROUP_CHECK_RETRY_DELAY)
-                            # forza un reload vero e proprio (non un semplice
-                            # driver.get sullo stesso URL) prima di ritentare,
-                            # nel caso la pagina sia rimasta bloccata in uno
-                            # stato non valido (es. checkpoint, spinner fisso)
-                            try:
-                                driver.refresh()
-                            except Exception:
-                                pass
-                else:
-                    print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
-                    continue
-
-                print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
-
-                if top_post is None:
-                    continue
-
-                print(f"  Testo estratto: {top_post['text'][:200]!r}")
-                if top_post["author"]:
-                    print(f"  Autore: {top_post['author']!r}")
-
-                if top_post["id"] == last_seen_ids[group_url]:
-                    continue
-
-                last_seen_ids[group_url] = top_post["id"]
-
-                process_top_post(top_post, alerted_posts, chats)
+            for t in threads:
+                t.join()
 
             print("Fine ciclo completo.")
-            
+
             for i in range(CHECK_INTERVAL):
                 print(f"{i}/{CHECK_INTERVAL}", end="", flush=True)
                 time.sleep(1)
-           
+
 
     except KeyboardInterrupt:
         print("\nMonitoraggio terminato.")
 
     finally:
-        driver.quit()
+        for d in drivers:
+            d.quit()
 
 
 if __name__ == "__main__":
