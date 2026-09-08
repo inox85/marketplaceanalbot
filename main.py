@@ -56,8 +56,13 @@ BAD_KEYWORDS = []  # parole che sopprimono l'alert, condivise da tutte le chat
 
 GROUPS = {}
 
-with open('groups.json') as f:
-    GROUPS = json.load(f)
+with open('groups.json', encoding="utf-8") as f:
+    ALL_GROUPS = json.load(f)
+
+# Il campo "attivo" è opzionale (assente = attivo di default), così i
+# gruppi esistenti in groups.json restano validi senza modifiche: basta
+# aggiungere "attivo": false per disattivarne uno senza doverlo rimuovere.
+GROUPS = [g for g in ALL_GROUPS if g.get("attivo", True)]
 
 
 GROUP_CHECK_RETRIES = 3  # tentativi per il controllo di un singolo gruppo prima di rinunciare
@@ -793,6 +798,10 @@ def main():
 
     print("Avvio monitor Facebook multi-gruppo...")
     print("Profilo Chrome:", CHROME_PROFILE)
+
+    disattivati = len(ALL_GROUPS) - len(GROUPS)
+    if disattivati:
+        print(f"Gruppi disattivati (attivo=false), esclusi dal monitoraggio: {disattivati}")
 
     print("Gruppi monitorati:")
     for g in GROUPS:
