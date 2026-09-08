@@ -786,10 +786,10 @@ def check_group(driver, group, chats, alerted_posts, last_seen_ids):
         try:
             driver.get(build_group_url(group_url))
             # aspetta che almeno un post sia comparso nel DOM, invece di un tempo fisso
-            time.sleep(5)
+            #time.sleep(5)
 
             # piccola pausa casuale, non per aspettare il caricamento ma per stealth
-            #time.sleep(random.uniform(0.1, 1))
+            time.sleep(random.uniform(0.1, 1))
             #select_new_posts(driver)
 
             top_post = get_top_post(driver, group_name, group_url)
