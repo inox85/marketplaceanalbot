@@ -4,6 +4,7 @@ import time
 import re
 import json
 import heapq
+import argparse
 import unicodedata
 import configparser
 from pathlib import Path
@@ -731,6 +732,21 @@ def select_new_posts(driver):
 # MAIN
 # ============================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Monitor Facebook multi-gruppo.")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Avvia Chrome senza finestra grafica (--headless=new). Richiede "
+            "che chrome_profile/ sia già autenticato su Facebook: il primo "
+            "login va fatto senza questa opzione, dato che in headless non "
+            "si vede la pagina per inserire le credenziali."
+        ),
+    )
+    return parser.parse_args()
+
+
 def reload_keywords():
     global KEYWORDS
     global BAD_KEYWORDS
@@ -805,6 +821,8 @@ def check_group(driver, group, chats, alerted_posts, last_seen_ids):
 
 
 def main():
+    args = parse_args()
+
     chiudi_chrome()
     if not GROUPS:
         print("Nessun gruppo configurato in GROUPS. Aggiungine almeno uno.")
@@ -812,6 +830,15 @@ def main():
 
     print("Avvio monitor Facebook multi-gruppo...")
     print("Profilo Chrome:", CHROME_PROFILE)
+    print("Modalità:", "headless (senza finestra)" if args.headless else "con finestra grafica")
+
+    if args.headless and not CHROME_PROFILE.exists():
+        print(
+            "ATTENZIONE: chrome_profile/ non esiste ancora, quindi non risulta "
+            "nessun login salvato. In modalità headless non potrai vedere la "
+            "pagina per effettuare il login manuale: riavvia senza --headless "
+            "per il primo login, poi torna a usare --headless."
+        )
 
     disattivati = len(ALL_GROUPS) - len(GROUPS)
     if disattivati:
@@ -830,6 +857,11 @@ def main():
     register_telegram_commands()
 
     options = Options()
+
+    if args.headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
 
     if sys.platform != "win32":
         # Path fissi del Raspberry Pi: su Windows lasciamo che Selenium
@@ -868,14 +900,15 @@ def main():
 
     try:
         first_group = GROUPS[0]
-        print(f"\nApro il primo gruppo ({first_group['name']}) per il login...")
+        print(f"\nApro il primo gruppo ({first_group['name']})...")
         driver.get(build_group_url(first_group["url"]))
         time.sleep(5)
         #select_new_posts(driver)
 
-        print()
-        print("Se necessario, effettua il login a Facebook.")
-        time.sleep(10)
+        if not args.headless:
+            print()
+            print("Se necessario, effettua il login a Facebook.")
+            time.sleep(10)
 
         print()
         print("Monitoraggio avviato con intervallo adattivo per gruppo.")
