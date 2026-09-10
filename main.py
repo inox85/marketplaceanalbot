@@ -443,6 +443,8 @@ def send_telegram_message(text, chat_id):
         )
         if response.status_code != 200:
             print(f"  Errore invio Telegram ({chat_id}): {response.status_code} - {response.text}")
+        else:
+            print(f"  Messaggio Telegram inviato correttamente a {chat_id}.")
     except Exception as e:
         print("  Errore invio Telegram:", e)
 
@@ -774,7 +776,7 @@ def check_group(driver, group, chats, alerted_posts, last_seen_ids):
         try:
             driver.get(build_group_url(group_url))
             # piccola pausa casuale, non per aspettare il caricamento ma per stealth
-            time.sleep(random.uniform(0.1, 1))
+            time.sleep(5)
             #select_new_posts(driver)
 
             top_post = get_top_post(driver, group_name, group_url)
@@ -802,7 +804,7 @@ def check_group(driver, group, chats, alerted_posts, last_seen_ids):
         print(f"Errore durante il controllo di {group_name}: tutti i {GROUP_CHECK_RETRIES} tentativi falliti.")
         return "failed"
 
-    print(f"[{time.strftime('%H:%M:%S')}] [{group_name}] Controllo eseguito.")
+    print(f"[{time.strftime('%H:%M:%S')}] [{group_name} : {group_url}] Controllo eseguito.")
 
     if top_post is None:
         return "same"
