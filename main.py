@@ -746,6 +746,16 @@ def parse_args():
             "si vede la pagina per inserire le credenziali."
         ),
     )
+    parser.add_argument(
+        "--fixed-interval",
+        action="store_true",
+        help=(
+            "Ignora l'algoritmo di priorità adattivo: ogni gruppo resta "
+            f"all'intervallo di partenza ({GROUP_CHECK_DEFAULT_INTERVAL}s), "
+            "senza accelerare sui gruppi attivi né rallentare su quelli "
+            "silenziosi. Utile per confronto/debug."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -913,10 +923,13 @@ def main():
             time.sleep(10)
 
         print()
-        print("Monitoraggio avviato con intervallo adattivo per gruppo.")
-        print(f"Ogni gruppo parte da {GROUP_CHECK_DEFAULT_INTERVAL}s tra un controllo e il successivo:")
-        print(f"  si restringe fino a {GROUP_CHECK_MIN_INTERVAL}s se trova post nuovi di seguito,")
-        print(f"  si allarga fino a {GROUP_CHECK_MAX_INTERVAL}s se resta silenzioso.")
+        if args.fixed_interval:
+            print(f"Monitoraggio avviato con intervallo fisso di {GROUP_CHECK_DEFAULT_INTERVAL}s per gruppo (algoritmo di priorità disattivato).")
+        else:
+            print("Monitoraggio avviato con intervallo adattivo per gruppo.")
+            print(f"Ogni gruppo parte da {GROUP_CHECK_DEFAULT_INTERVAL}s tra un controllo e il successivo:")
+            print(f"  si restringe fino a {GROUP_CHECK_MIN_INTERVAL}s se trova post nuovi di seguito,")
+            print(f"  si allarga fino a {GROUP_CHECK_MAX_INTERVAL}s se resta silenzioso.")
         print("Ad ogni controllo esamino solo il post in cima al feed (posinset=1) del gruppo.")
         print()
 
@@ -947,7 +960,9 @@ def main():
             result = check_group(driver, group, chats, alerted_posts, last_seen_ids)
 
             interval = intervals[group_url]
-            if result == "new":
+            if args.fixed_interval:
+                pass  # algoritmo di priorità disattivato: intervallo sempre quello di partenza
+            elif result == "new":
                 interval = max(GROUP_CHECK_MIN_INTERVAL, interval / GROUP_CHECK_SPEEDUP_FACTOR)
                 print(f"  -> {group['name']} attivo: prossimo controllo tra {interval:.0f}s")
             elif result == "same":
