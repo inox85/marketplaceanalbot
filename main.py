@@ -4,7 +4,9 @@ import time
 import re
 import json
 import heapq
+import shutil
 import argparse
+import threading
 import unicodedata
 import configparser
 from pathlib import Path
@@ -81,6 +83,13 @@ GROUP_CHECK_MAX_INTERVAL = 90       # secondi massimi per un gruppo silenzioso
 GROUP_CHECK_DEFAULT_INTERVAL = 15   # intervallo di partenza, prima di sapere quanto è attivo
 GROUP_CHECK_SPEEDUP_FACTOR = 2      # riduzione dell'intervallo dopo un post nuovo
 GROUP_CHECK_SLOWDOWN_FACTOR = 1.3   # aumento dell'intervallo se non trova nulla di nuovo
+
+# Protegge la coda di priorità (schedule/intervals) da accessi concorrenti
+# quando ci sono più worker; protegge inoltre chats/alerted_posts (e i
+# relativi salvataggi su disco) dato che più worker possono processare un
+# match quasi contemporaneamente.
+SCHEDULE_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 
 POST_SELECTOR = 'div[aria-posinset="1"]'
 
@@ -756,7 +765,78 @@ def parse_args():
             "silenziosi. Utile per confronto/debug."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Numero di istanze Chrome parallele che pescano i gruppi da "
+            "controllare dalla stessa coda di priorità (non una divisione "
+            "statica dei gruppi): un worker libero prende semplicemente il "
+            "prossimo gruppo più urgente. Default 1 (nessun parallelismo). "
+            "Ogni worker oltre il primo clona chrome_profile/ (può volerci "
+            "qualche minuto la prima volta) e apre un'istanza Chrome in più: "
+            "da usare con --headless per limitare il consumo di RAM."
+        ),
+    )
     return parser.parse_args()
+
+
+def clone_chrome_profile(worker_index):
+    """
+    Ogni istanza Chrome ha bisogno del proprio --user-data-dir: due processi
+    non possono condividere la stessa cartella profilo. Duplichiamo quindi il
+    profilo principale (già loggato su Facebook) una volta sola per ciascun
+    worker aggiuntivo, così partono già autenticati senza rifare il login.
+    """
+    worker_profile = CHROME_PROFILE.parent / f"{CHROME_PROFILE.name}_worker{worker_index}"
+    if not worker_profile.exists():
+        print(f"Clono il profilo Chrome per il worker {worker_index} (può volerci qualche minuto)...")
+        shutil.copytree(CHROME_PROFILE, worker_profile)
+    return worker_profile
+
+
+def build_driver(profile_dir, args):
+    options = Options()
+
+    if args.headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+
+    if sys.platform != "win32":
+        # Path fissi del Raspberry Pi: su Windows lasciamo che Selenium
+        # trovi da solo Chrome e il chromedriver giusto (Selenium Manager).
+        options.binary_location = "/usr/bin/chromium"
+
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+
+    if sys.platform != "win32":
+        service = Service("/usr/bin/chromedriver")
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
+
+    try:
+        # Font e media non servono a estrarre il testo del post: li
+        # blocchiamo via CDP oltre alle immagini (già disattivate sopra)
+        # per alleggerire ulteriormente il caricamento. Non tocchiamo i
+        # CSS: senza stile, elementi che Facebook nasconde a video
+        # potrebbero risultare "visibili" nel DOM e sporcare il testo
+        # estratto da get_top_post().
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {
+            "urls": [
+                "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+                "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.avi", "*.mov",
+            ]
+        })
+    except Exception as e:
+        print("Impossibile impostare il blocco extra di font/media via CDP:", e)
+
+    return driver
 
 
 def reload_keywords():
@@ -828,8 +908,59 @@ def check_group(driver, group, chats, alerted_posts, last_seen_ids):
 
     last_seen_ids[group_url] = top_post["id"]
 
-    process_top_post(top_post, alerted_posts, chats)
+    with STATE_LOCK:
+        process_top_post(top_post, alerted_posts, chats)
     return "new"
+
+
+def pop_due_group(schedule):
+    """Estrae dalla coda il prossimo gruppo dovuto, o None se non c'è ancora nulla da controllare."""
+    with SCHEDULE_LOCK:
+        if not schedule:
+            return None
+        next_time, group_url = schedule[0]
+        if next_time > time.time():
+            return None
+        heapq.heappop(schedule)
+        return group_url
+
+
+def reschedule_group(schedule, intervals, group_url, group_name, result, fixed_interval):
+    with SCHEDULE_LOCK:
+        interval = intervals[group_url]
+        if fixed_interval:
+            pass  # algoritmo di priorità disattivato: intervallo sempre quello di partenza
+        elif result == "new":
+            interval = max(GROUP_CHECK_MIN_INTERVAL, interval / GROUP_CHECK_SPEEDUP_FACTOR)
+            print(f"  -> {group_name} attivo: prossimo controllo tra {interval:.0f}s")
+        elif result == "same":
+            interval = min(GROUP_CHECK_MAX_INTERVAL, interval * GROUP_CHECK_SLOWDOWN_FACTOR)
+        # "failed": lascia l'intervallo invariato, non è indicativo
+        # dell'attività del gruppo
+
+        intervals[group_url] = interval
+        heapq.heappush(schedule, (time.time() + interval, group_url))
+
+
+def worker_loop(driver, chats, alerted_posts, last_seen_ids, groups_by_url, intervals, schedule, args, stop_event):
+    while not stop_event.is_set():
+        group_url = pop_due_group(schedule)
+        if group_url is None:
+            # nessun gruppo ancora dovuto: aspetta un attimo e riprova,
+            # invece di consumare CPU in un loop stretto
+            time.sleep(0.2)
+            continue
+
+        group = groups_by_url[group_url]
+        try:
+            result = check_group(driver, group, chats, alerted_posts, last_seen_ids)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"Errore inatteso nel worker sul gruppo {group['name']}:", e)
+            result = "failed"
+
+        reschedule_group(schedule, intervals, group_url, group["name"], result, args.fixed_interval)
 
 
 def main():
@@ -868,45 +999,11 @@ def main():
 
     register_telegram_commands()
 
-    options = Options()
+    worker_count = max(1, min(args.workers, len(GROUPS)))
+    print(f"Worker paralleli: {worker_count}")
 
-    if args.headless:
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-
-    if sys.platform != "win32":
-        # Path fissi del Raspberry Pi: su Windows lasciamo che Selenium
-        # trovi da solo Chrome e il chromedriver giusto (Selenium Manager).
-        options.binary_location = "/usr/bin/chromium"
-
-    options.add_argument(
-        f"--user-data-dir={CHROME_PROFILE}"
-    )
-    options.add_argument("--blink-settings=imagesEnabled=false")
-
-    if sys.platform != "win32":
-        service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=options)
-    else:
-        driver = webdriver.Chrome(options=options)
-
-    try:
-        # Font e media non servono a estrarre il testo del post: li
-        # blocchiamo via CDP oltre alle immagini (già disattivate sopra)
-        # per alleggerire ulteriormente il caricamento. Non tocchiamo i
-        # CSS: senza stile, elementi che Facebook nasconde a video
-        # potrebbero risultare "visibili" nel DOM e sporcare il testo
-        # estratto da get_top_post().
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [
-                "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
-                "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.avi", "*.mov",
-            ]
-        })
-    except Exception as e:
-        print("Impossibile impostare il blocco extra di font/media via CDP:", e)
+    driver = build_driver(CHROME_PROFILE, args)
+    drivers = [driver]
 
     last_seen_ids = {g["url"]: None for g in GROUPS}
 
@@ -933,52 +1030,47 @@ def main():
         print("Ad ogni controllo esamino solo il post in cima al feed (posinset=1) del gruppo.")
         print()
 
+        # Gli eventuali worker aggiuntivi partono dopo il login sul profilo
+        # principale, così ereditano subito la sessione già autenticata.
+        for i in range(1, worker_count):
+            profile_dir = clone_chrome_profile(i)
+            drivers.append(build_driver(profile_dir, args))
+
         groups_by_url = {g["url"]: g for g in GROUPS}
         intervals = {g["url"]: GROUP_CHECK_DEFAULT_INTERVAL for g in GROUPS}
         # coda di priorità (next_check_time, group_url): tutti i gruppi
         # partono "dovuti" subito, poi ciascuno si ripianifica in base a
-        # quanto si è rivelato attivo.
+        # quanto si è rivelato attivo. Condivisa tra tutti i worker: un
+        # worker libero pesca semplicemente il prossimo gruppo più urgente.
         schedule = [(time.time(), g["url"]) for g in GROUPS]
         heapq.heapify(schedule)
 
+        stop_event = threading.Event()
+        threads = [
+            threading.Thread(
+                target=worker_loop,
+                args=(d, chats, alerted_posts, last_seen_ids, groups_by_url, intervals, schedule, args, stop_event),
+                daemon=True,
+            )
+            for d in drivers
+        ]
+        for t in threads:
+            t.start()
+
+        # I comandi Telegram e il reload delle keyword restano sul thread
+        # principale, indipendenti dalla frequenza di controllo dei gruppi.
         while True:
-
             reload_keywords()
-            process_telegram_commands(chats)
-
-            now = time.time()
-            next_time, group_url = schedule[0]
-            if next_time > now:
-                # nessun gruppo ancora dovuto: aspetta al massimo 1s per
-                # restare comunque reattivo ai comandi Telegram
-                time.sleep(min(next_time - now, 1))
-                continue
-
-            heapq.heappop(schedule)
-            group = groups_by_url[group_url]
-
-            result = check_group(driver, group, chats, alerted_posts, last_seen_ids)
-
-            interval = intervals[group_url]
-            if args.fixed_interval:
-                pass  # algoritmo di priorità disattivato: intervallo sempre quello di partenza
-            elif result == "new":
-                interval = max(GROUP_CHECK_MIN_INTERVAL, interval / GROUP_CHECK_SPEEDUP_FACTOR)
-                print(f"  -> {group['name']} attivo: prossimo controllo tra {interval:.0f}s")
-            elif result == "same":
-                interval = min(GROUP_CHECK_MAX_INTERVAL, interval * GROUP_CHECK_SLOWDOWN_FACTOR)
-            # "failed": lascia l'intervallo invariato, non è indicativo
-            # dell'attività del gruppo
-
-            intervals[group_url] = interval
-            heapq.heappush(schedule, (time.time() + interval, group_url))
-           
+            with STATE_LOCK:
+                process_telegram_commands(chats)
+            time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nMonitoraggio terminato.")
 
     finally:
-        driver.quit()
+        for d in drivers:
+            d.quit()
 
 
 if __name__ == "__main__":
