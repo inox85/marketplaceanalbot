@@ -28,6 +28,42 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+
+class _TeeStream:
+    """
+    Duplica ogni scrittura su più stream (console + file di log), con un
+    timestamp a inizio riga. Serve perché se il programma crasha mentre
+    gira da start.bat o headless via SSH, la finestra/sessione si chiude
+    subito e il traceback (stampato su stderr) andrebbe perso per sempre
+    senza una copia persistente su disco.
+    """
+    def __init__(self, *streams):
+        self._streams = streams
+        self._at_line_start = True
+
+    def write(self, data):
+        for chunk in data.splitlines(keepends=True):
+            if self._at_line_start and chunk.strip("\n"):
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                for s in self._streams:
+                    s.write(f"[{timestamp}] ")
+            for s in self._streams:
+                s.write(chunk)
+            self._at_line_start = chunk.endswith("\n")
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+    def isatty(self):
+        return False
+
+
+LOG_FILE = Path.cwd() / "bot.log"
+_log_file_handle = open(LOG_FILE, "a", encoding="utf-8")
+sys.stdout = _TeeStream(sys.stdout, _log_file_handle)
+sys.stderr = _TeeStream(sys.stderr, _log_file_handle)
+
 # ============================================================
 # CONFIGURAZIONE
 # ============================================================
@@ -1060,17 +1096,35 @@ def main():
         # I comandi Telegram e il reload delle keyword restano sul thread
         # principale, indipendenti dalla frequenza di controllo dei gruppi.
         while True:
-            reload_keywords()
-            with STATE_LOCK:
-                process_telegram_commands(chats)
+            try:
+                reload_keywords()
+                with STATE_LOCK:
+                    process_telegram_commands(chats)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # non deve mai far cadere il processo: un errore qui (es.
+                # keywords.json momentaneamente non valido perché in fase
+                # di salvataggio, o un problema di rete verso Telegram) non
+                # deve fermare il monitoraggio dei gruppi sugli altri thread
+                print(f"Errore nel loop comandi Telegram/keyword: {type(e).__name__}: {e}")
             time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nMonitoraggio terminato.")
 
+    except Exception:
+        import traceback
+        print("ERRORE FATALE, il monitoraggio si interrompe:")
+        traceback.print_exc()
+        raise
+
     finally:
         for d in drivers:
-            d.quit()
+            try:
+                d.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
