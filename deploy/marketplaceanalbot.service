@@ -2,6 +2,10 @@
 Description=Marketplace Facebook groups monitor bot
 After=network-online.target
 Wants=network-online.target
+# Nessun limite al numero di riavvii: preferiamo che il bot continui a
+# ritentare all'infinito piuttosto che fermarsi silenziosamente dopo
+# troppi crash ravvicinati (comportamento di default di systemd).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,10 +14,6 @@ WorkingDirectory=/home/rpi/src/marketplaceanalbot
 ExecStart=/home/rpi/src/marketplaceanalbot/venv/bin/python3 main.py --headless --workers 3
 Restart=always
 RestartSec=10
-# Nessun limite al numero di riavvii: preferiamo che il bot continui a
-# ritentare all'infinito piuttosto che fermarsi silenziosamente dopo
-# troppi crash ravvicinati (comportamento di default di systemd).
-StartLimitIntervalSec=0
 
 StandardOutput=journal
 StandardError=journal
