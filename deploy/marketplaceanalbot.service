@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=rpi
 WorkingDirectory=/home/rpi/src/marketplaceanalbot
-ExecStart=/usr/bin/python3 main.py --headless --workers 3
+ExecStart=/home/rpi/src/marketplaceanalbot/venv/bin/python3 main.py --headless --workers 3
 Restart=always
 RestartSec=10
 # Nessun limite al numero di riavvii: preferiamo che il bot continui a
