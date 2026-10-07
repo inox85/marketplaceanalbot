@@ -829,7 +829,15 @@ def clone_chrome_profile(worker_index):
     worker_profile = CHROME_PROFILE.parent / f"{CHROME_PROFILE.name}_worker{worker_index}"
     if not worker_profile.exists():
         print(f"Clono il profilo Chrome per il worker {worker_index} (può volerci qualche minuto)...")
-        shutil.copytree(CHROME_PROFILE, worker_profile)
+        shutil.copytree(
+                CHROME_PROFILE,
+                worker_profile,
+                ignore=shutil.ignore_patterns(
+                    "SingletonSocket",
+                    "SingletonCookie",
+                    "SingletonLock"
+                )
+                )
     return worker_profile
 
 
@@ -847,7 +855,7 @@ def build_driver(profile_dir, args):
         options.binary_location = "/usr/bin/chromium"
 
     options.add_argument(f"--user-data-dir={profile_dir}")
-    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--blink-settings=imagesEnabled=true")
 
     if sys.platform != "win32":
         service = Service("/usr/bin/chromedriver")
@@ -1019,6 +1027,8 @@ def main():
             "per il primo login, poi torna a usare --headless."
         )
 
+    
+
     disattivati = len(ALL_GROUPS) - len(GROUPS)
     if disattivati:
         print(f"Gruppi disattivati (attivo=false), esclusi dal monitoraggio: {disattivati}")
@@ -1046,7 +1056,10 @@ def main():
     try:
         first_group = GROUPS[0]
         print(f"\nApro il primo gruppo ({first_group['name']})...")
+        
         driver.get(build_group_url(first_group["url"]))
+
+        input("Loggarsi su FB se necessario!")
         time.sleep(5)
         #select_new_posts(driver)
 
