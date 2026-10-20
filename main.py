@@ -371,18 +371,58 @@ def clean_description(body):
     return body if body else None
 
 
+# ------------------------------------------------------------
+# Identificativo stabile del post (per la deduplica degli alert).
+# Il testo estratto da Facebook contiene parti che cambiano ad ogni
+# controllo anche se il post è lo stesso: tempo relativo ("10 minuti
+# fa", "circa un'ora fa"), contatori ("12 h"), sequenze di caratteri
+# mescolati, etichette dell'interfaccia ("Post condiviso", "Rispondi
+# come ...") e testo alternativo delle foto ("Potrebbe essere
+# un'immagine raffigurante ..."). Vengono tutte rimosse prima di
+# calcolare l'ID.
+# ------------------------------------------------------------
+ID_NOISE_PATTERNS = [
+    re.compile(r"(?:circa\s+)?(?:un'?\s?ora|un\s+\w+|\d+\s+\w+)\s+fa\b", re.IGNORECASE),
+    re.compile(r"(?:(?<!\S)\S{1,2}(?=\s|$)\s*){6,}"),
+    re.compile(r"\b\d+\s?(?:h|g|min|sett)\b", re.IGNORECASE),
+    re.compile(r"potrebbe essere un.immagine[^.]*\.?", re.IGNORECASE),
+    re.compile(r"nessuna descrizione della foto disponibile\.*", re.IGNORECASE),
+    re.compile(r"tutte le reazioni:?", re.IGNORECASE),
+    re.compile(r"rispondi come \w+", re.IGNORECASE),
+    re.compile(r"\b(?:post condiviso|messaggio|segui|amministratore|gratuito|altro)\b", re.IGNORECASE),
+    re.compile(r"\+\s?\d+\b"),
+]
+ID_HEAD_LENGTH = 100
+ID_SHORT_TEXT_LENGTH = 40
+
+
+def _normalize_for_id(text):
+    for pattern in ID_NOISE_PATTERNS:
+        text = pattern.sub(" ", text)
+    text = re.sub(r"[^\w]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def build_post_id(author, description):
+    """
+    ID indipendente dal gruppo (lo stesso annuncio pubblicato in più
+    gruppi non deve generare più alert) e dal rumore variabile. Conta
+    solo l'inizio del testo, cioè ciò che ha scritto l'autore. Se il
+    testo è molto corto aggiungiamo nome e cognome dell'autore per non
+    confondere due annunci diversi come "N40 regalo".
+    """
+    head = _normalize_for_id(description)[:ID_HEAD_LENGTH].strip()
+    if len(head) < ID_SHORT_TEXT_LENGTH:
+        name = " ".join(_normalize_for_id(author or "").split()[:2])
+        if name:
+            head = f"{name} | {head}"
+    return head
+
+
 def contains_keyword(text, keywords):
     """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
     text_lower = text.lower()
     for keyword in keywords:
-        if keyword.lower() in text_lower:
-            return keyword
-    return None
-
-def contains_bad_keyword(text):
-    """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
-    text_lower = text.lower()
-    for keyword in BAD_KEYWORDS:
         if keyword.lower() in text_lower:
             return keyword
     return None
@@ -457,11 +497,7 @@ def get_top_post(driver, group_name, group_url):
 
     post_url, hrefs = extract_post_url(container)
 
-    id_parts = [group_name]
-    if author:
-        id_parts.append(author)
-    id_parts.append(description)
-    post_id = " | ".join(id_parts)[:1000]
+    post_id = build_post_id(author, description)
 
     return {
         "id": post_id,
@@ -496,19 +532,24 @@ def send_telegram_message(text, chat_id):
 
 def process_top_post(top_post, alerted_posts, chats):
     """
-    A differenza delle parole chiave (una lista per ogni chat, vedi
-    `chats`), le "bad keyword" restano condivise da tutte le chat: se
-    una compare nel testo, nessuna chat viene avvisata per quel post.
+    Sia le parole chiave che le bad keyword sono personalizzabili per
+    ogni chat (vedi `chats`): una chat può essere avvisata per un post
+    che un'altra chat sopprime, e viceversa.
     """
-    if contains_bad_keyword(top_post["text"]):
-        print("Trovata keyword non desiderata!")
-        return False
-
     matched = False
 
     for chat_id, chat_data in chats.items():
         keyword = contains_keyword(top_post["text"], chat_data.get("keywords", []))
         if not keyword:
+            continue
+
+        # Se la chat non ha ancora personalizzato le sue bad keyword,
+        # eredita quelle di default (bad_keywords.json), non una lista
+        # vuota: altrimenti chi si è iscritto prima di questa modifica
+        # perderebbe di colpo il filtro che aveva finora.
+        bad_keywords = chat_data.get("bad_keywords", BAD_KEYWORDS)
+        if contains_keyword(top_post["text"], bad_keywords):
+            print(f"Trovata keyword non desiderata per la chat {chat_id}!")
             continue
 
         alert_key = f"{chat_id}|{top_post['id']}"
@@ -564,14 +605,18 @@ SUBSCRIBE_MESSAGE = (
     "/add <parola> - aggiunge una parola chiave da cercare\n"
     "/remove <parola> - rimuove una parola chiave\n"
     "/keywords - mostra le tue parole chiave\n"
-    "/clear - rimuove tutte le parole chiave\n\n"
+    "/clear - rimuove tutte le parole chiave\n"
+    "/addbad <parola> - aggiunge una parola da escludere (se presente, l'annuncio non ti viene segnalato)\n"
+    "/removebad <parola> - rimuove una parola da escludere\n"
+    "/badkeywords - mostra le tue parole da escludere\n"
+    "/clearbad - rimuove tutte le parole da escludere\n\n"
     "Parole chiave di partenza:\n{keywords}"
 )
 
 
 def handle_subscribe(chat_id, chats):
     if chat_id not in chats:
-        chats[chat_id] = {"keywords": list(KEYWORDS)}
+        chats[chat_id] = {"keywords": list(KEYWORDS), "bad_keywords": list(BAD_KEYWORDS)}
         save_chats(chats)
 
     keywords_list = ", ".join(sorted(chats[chat_id]["keywords"], key=str.lower)) or "(nessuna)"
@@ -639,12 +684,77 @@ def handle_clear(chat_id, chats):
     send_telegram_message("🗑️ Tutte le parole chiave sono state rimosse.", chat_id)
 
 
+def handle_addbad(chat_id, argument, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    parola = argument.strip().lower()
+    if not parola:
+        send_telegram_message("Uso: /addbad <parola>", chat_id)
+        return
+
+    bad_keywords = chats[chat_id].setdefault("bad_keywords", list(BAD_KEYWORDS))
+    if any(k.lower() == parola for k in bad_keywords):
+        send_telegram_message(f"'{parola}' è già tra le tue parole da escludere.", chat_id)
+        return
+
+    bad_keywords.append(parola)
+    save_chats(chats)
+    send_telegram_message(f"✅ Aggiunta parola da escludere: '{parola}'", chat_id)
+
+
+def handle_removebad(chat_id, argument, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    parola = argument.strip().lower()
+    if not parola:
+        send_telegram_message("Uso: /removebad <parola>", chat_id)
+        return
+
+    bad_keywords = chats[chat_id].setdefault("bad_keywords", list(BAD_KEYWORDS))
+    match = next((k for k in bad_keywords if k.lower() == parola), None)
+    if not match:
+        send_telegram_message(f"'{parola}' non è tra le tue parole da escludere.", chat_id)
+        return
+
+    bad_keywords.remove(match)
+    save_chats(chats)
+    send_telegram_message(f"🗑️ Rimossa parola da escludere: '{parola}'", chat_id)
+
+
+def handle_badkeywords(chat_id, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    bad_keywords = chats[chat_id].get("bad_keywords", BAD_KEYWORDS)
+    bad_keywords_list = ", ".join(sorted(bad_keywords, key=str.lower)) or "(nessuna)"
+    send_telegram_message(f"Le tue parole da escludere:\n{bad_keywords_list}", chat_id)
+
+
+def handle_clearbad(chat_id, chats):
+    if chat_id not in chats:
+        send_telegram_message("Devi prima iscriverti con /subscribe.", chat_id)
+        return
+
+    chats[chat_id]["bad_keywords"] = []
+    save_chats(chats)
+    send_telegram_message("🗑️ Tutte le parole da escludere sono state rimosse.", chat_id)
+
+
 TELEGRAM_COMMANDS = [
     {"command": "subscribe", "description": "Iscrivi questa chat agli avvisi"},
     {"command": "add", "description": "Aggiungi una parola chiave"},
     {"command": "remove", "description": "Rimuovi una parola chiave"},
     {"command": "keywords", "description": "Mostra le tue parole chiave"},
     {"command": "clear", "description": "Rimuovi tutte le parole chiave"},
+    {"command": "addbad", "description": "Aggiungi una parola da escludere"},
+    {"command": "removebad", "description": "Rimuovi una parola da escludere"},
+    {"command": "badkeywords", "description": "Mostra le tue parole da escludere"},
+    {"command": "clearbad", "description": "Rimuovi tutte le parole da escludere"},
 ]
 
 
@@ -711,6 +821,14 @@ def process_telegram_commands(chats):
             handle_keywords(chat_id, chats)
         elif command == "/clear":
             handle_clear(chat_id, chats)
+        elif command == "/addbad":
+            handle_addbad(chat_id, argument, chats)
+        elif command == "/removebad":
+            handle_removebad(chat_id, argument, chats)
+        elif command == "/badkeywords":
+            handle_badkeywords(chat_id, chats)
+        elif command == "/clearbad":
+            handle_clearbad(chat_id, chats)
 
 
 def select_new_posts(driver):

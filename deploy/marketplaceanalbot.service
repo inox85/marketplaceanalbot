@@ -11,6 +11,10 @@ StartLimitIntervalSec=0
 Type=simple
 User=rpi
 WorkingDirectory=/home/rpi/src/marketplaceanalbot
+# Senza questa, l'output di Python è bufferizzato quando non gira su un
+# terminale: i print() del bot arriverebbero a journalctl/bot.log solo a
+# blocchi (o mai, se il processo viene ucciso prima del flush).
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/rpi/src/marketplaceanalbot/venv/bin/python3 main.py --headless --workers 3
 Restart=always
 RestartSec=10
