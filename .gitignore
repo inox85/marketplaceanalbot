@@ -3,3 +3,7 @@
 /secrets.ini
 /chats.json
 secrets.ini
+/chrome_profile_worker1
+/chrome_profile_worker2
+/bot.log
+/.venv

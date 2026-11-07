@@ -816,6 +816,13 @@ def parse_args():
             "da usare con --headless per limitare il consumo di RAM."
         ),
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help=(
+            "Richiesta di login su FB, comporta una pausa per logarsi"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -855,11 +862,12 @@ def build_driver(profile_dir, args):
         options.binary_location = "/usr/bin/chromium"
 
     options.add_argument(f"--user-data-dir={profile_dir}")
-    options.add_argument("--blink-settings=imagesEnabled=true")
+    options.add_argument("--blink-settings=imagesEnabled=false")
 
     if sys.platform != "win32":
         service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=options)
+        #driver = webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(options=options)
     else:
         driver = webdriver.Chrome(options=options)
 
@@ -1059,14 +1067,13 @@ def main():
         
         driver.get(build_group_url(first_group["url"]))
 
-        input("Loggarsi su FB se necessario!")
         time.sleep(5)
         #select_new_posts(driver)
 
-        if not args.headless:
+        if args.login:
             print()
-            print("Se necessario, effettua il login a Facebook.")
-            time.sleep(10)
+            input("Se necessario, effettua il login a Facebook!")
+
 
         print()
         if args.fixed_interval:
