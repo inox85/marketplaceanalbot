@@ -7,8 +7,10 @@ import heapq
 import shutil
 import argparse
 import threading
+import html
 import unicodedata
 import configparser
+from difflib import SequenceMatcher
 from pathlib import Path
 import psutil
 
@@ -153,24 +155,117 @@ def chiudi_chrome():
 
 
 
+ALERTED_RETENTION_DAYS = 60  # oltre questa età un post segnalato viene dimenticato
+TEXT_SIMILARITY_THRESHOLD = 0.85  # sopra questa somiglianza due testi sono "lo stesso annuncio"
+
+
+def _legacy_record(entry):
+    """
+    Converte una voce del vecchio formato ("<chat>|<gruppo> | <autore con
+    tempo relativo> | <descrizione>") in un record strutturato, così i post
+    già segnalati in passato restano riconosciuti anche col nuovo confronto.
+    """
+    chat_id, _, rest = entry.partition("|")
+    parts = rest.split(" | ")
+    group = parts[0] if parts else ""
+    if len(parts) >= 3:
+        meta = parse_header_meta(parts[1])
+        description = " | ".join(parts[2:])
+    else:
+        meta = parse_header_meta("")
+        description = " | ".join(parts[1:])
+    post = build_post(group, "", meta, description)
+    return make_alert_record(chat_id, post, ts=time.time())
+
+
+def make_alert_record(chat_id, post, ts=None):
+    return {
+        "chat_id": str(chat_id),
+        "group": post["group_name"],
+        "author": post["author"],
+        "published": post["published"],
+        "url": post["url"],
+        "text": post["norm_text"][:600],
+        "ts": ts or time.time(),
+    }
+
+
 def load_alerted_posts():
-    """Carica da disco gli ID dei post già segnalati in passato."""
+    """Carica da disco i post già segnalati (convertendo il vecchio formato)."""
+    records = []
     if ALERTED_POSTS_FILE.exists():
         try:
             with open(ALERTED_POSTS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                data = json.load(f)
+            migrated = 0
+            for entry in data:
+                if isinstance(entry, str):
+                    records.append(_legacy_record(entry))
+                    migrated += 1
+                else:
+                    records.append(entry)
+            if migrated:
+                print(f"Convertiti {migrated} post segnalati dal vecchio formato.")
         except Exception as e:
             print("Impossibile leggere", ALERTED_POSTS_FILE, "->", e)
-    return set()
+
+    cutoff = time.time() - ALERTED_RETENTION_DAYS * 86400
+    return [r for r in records if r.get("ts", 0) >= cutoff]
 
 
 def save_alerted_posts(alerted_posts):
-    """Salva su disco l'insieme aggiornato dei post già segnalati."""
+    """Salva su disco l'elenco aggiornato dei post già segnalati."""
     try:
-        with open(ALERTED_POSTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(alerted_posts), f, ensure_ascii=False, indent=2)
+        tmp = ALERTED_POSTS_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(alerted_posts, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, ALERTED_POSTS_FILE)
     except Exception as e:
         print("Impossibile salvare", ALERTED_POSTS_FILE, "->", e)
+
+
+def texts_match(a, b):
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    # testo troncato ("Altro...") vs espanso, o post modificato aggiungendo
+    # una riga ("Assegnato", "Zona coop..."): uno contiene l'altro
+    if len(short) >= 30 and short in long_:
+        return True
+    matcher = SequenceMatcher(None, a, b, autojunk=False)
+    return (matcher.real_quick_ratio() >= TEXT_SIMILARITY_THRESHOLD
+            and matcher.quick_ratio() >= TEXT_SIMILARITY_THRESHOLD
+            and matcher.ratio() >= TEXT_SIMILARITY_THRESHOLD)
+
+
+def is_duplicate(record, previous):
+    """
+    Due segnalazioni sono lo stesso annuncio se coincide il link del post,
+    oppure stesso autore + stessa data di pubblicazione, oppure stesso
+    autore + testo molto simile (anche in un gruppo diverso: chi pubblica
+    lo stesso oggetto in più gruppi genera un solo avviso). Senza autore,
+    serve lo stesso gruppo e un testo molto simile.
+    """
+    if record["url"] and record["url"] == previous.get("url"):
+        return True
+
+    author = record["author"].lower()
+    same_author = bool(author) and author == (previous.get("author") or "").lower()
+
+    if same_author and record["published"] and record["published"] == previous.get("published"):
+        return True
+    if same_author or (not author and record["group"] == previous.get("group")):
+        return texts_match(record["text"], previous.get("text", ""))
+    return False
+
+
+def find_previous_alert(record, alerted_posts):
+    for previous in alerted_posts:
+        if previous.get("chat_id") == record["chat_id"] and is_duplicate(record, previous):
+            return previous
+    return None
 
 
 # ============================================================
@@ -250,8 +345,8 @@ UI_LABEL_SEGMENTS = {"segui", "messaggio", "iscriviti", "segui già"}
 # schema va scartato dalla descrizione.
 # ------------------------------------------------------------
 COMMENT_PREVIEW_RE = re.compile(
-    r"\d+(?:\s+\d+)?\s+(?:[A-ZÀÈÉÌÒÙ][\w'\-]*\s+){1,4}"
-    r"·\s*\d+\s*(?:min|h|g|ore|giorni|sett|mese|mesi|anno|anni)\b"
+    r"\d+(?:\s+\d+)?\s+(?:[A-ZÀÈÉÌÒÙ][\w'\-.]*\s+){1,4}"
+    r"·\s*\d+\s*(?:min(?:uti?)?|h|ore?|g|giorni|sett(?:imane)?|mese|mesi|anno|anni)\b"
 )
 
 
@@ -334,6 +429,109 @@ def extract_author(header):
     return header.strip()
 
 
+# ------------------------------------------------------------
+# Metadati nell'intestazione. Oggi Facebook non mescola più l'orario
+# carattere per carattere: l'header arriva come testo leggibile, tipo
+#   "Maria Pepe 2 minuti fa Venerdì 6 novembre 2026 alle ore 09:06"
+#   "Pannee Siriwong si trova a Caldine . circa un'ora fa"
+#   "Giuseppe Gubinelli Amministratore 3 ore fa"
+# Il tempo RELATIVO ("2 minuti fa") cambia ad ogni controllo: se resta
+# attaccato al nome, l'ID del post cambia ogni minuto e lo stesso
+# annuncio viene notificato più volte. La data ASSOLUTA invece è stabile
+# ed è un ottimo identificatore del post.
+# ------------------------------------------------------------
+_WEEKDAYS = r"(?:lunedì|martedì|mercoledì|giovedì|venerdì|sabato|domenica)"
+_MONTHS = (r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+           r"settembre|ottobre|novembre|dicembre)")
+
+ABS_DATE_RE = re.compile(
+    rf"{_WEEKDAYS}\s+\d{{1,2}}\s+{_MONTHS}\s+\d{{4}}(?:\s+alle\s+ore\s+\d{{1,2}}:\d{{2}})?",
+    re.IGNORECASE,
+)
+REL_TIME_RE = re.compile(
+    r"(?:circa\s+)?(?:\d+|un|una|un')\s*"
+    r"(?:secondi?|minut[oi]|or[ae]|giorn[oi]|settiman[ae]|mes[ei]|ann[oi])\s+fa\b"
+    r"|\b(?:adesso|proprio ora|ieri(?:\s+alle\s+ore\s+\d{1,2}:\d{2})?)\b"
+    rf"|\b\d{{1,2}}\s+{_MONTHS}(?:\s+\d{{4}})?(?:\s+alle\s+ore\s+\d{{1,2}}:\d{{2}})?"
+    r"|\b\d+\s*(?:min|h|g|sett)\b",
+    re.IGNORECASE,
+)
+LOCATION_RE = re.compile(r"\s+si trova (?:a|in|presso)\s+(.+?)\s*\.?\s*$", re.IGNORECASE)
+AUTHOR_BADGES_RE = re.compile(
+    r"\s+(?:Amministratore|Amministratrice|Moderatore|Moderatrice|"
+    r"Esperto del gruppo|Esperta del gruppo|Fan più attivo|Collaboratore|"
+    r"Nuovo membro|Membro principiante)\b.*$",
+    re.IGNORECASE,
+)
+
+
+def parse_header_meta(raw_author):
+    """
+    Separa dall'intestazione grezza: nome autore, luogo ("si trova a"),
+    tempo relativo ("2 ore fa", solo per mostrarlo nella notifica) e data
+    assoluta di pubblicazione (stabile, usata per riconoscere il post).
+    """
+    published = ""
+    abs_match = ABS_DATE_RE.search(raw_author)
+    if abs_match:
+        published = re.sub(r"\s+", " ", abs_match.group(0)).strip()
+
+    rel_match = REL_TIME_RE.search(raw_author)
+    rel_time = rel_match.group(0).strip() if rel_match else ""
+
+    cut = min([m.start() for m in (abs_match, rel_match) if m] or [len(raw_author)])
+
+    name = raw_author[:cut].strip(" .·")
+
+    location = ""
+    loc_match = LOCATION_RE.search(name)
+    if loc_match:
+        location = loc_match.group(1).strip(" .")
+        name = name[:loc_match.start()]
+
+    name = AUTHOR_BADGES_RE.sub("", name).strip(" .·")
+    return {"author": name, "location": location, "rel_time": rel_time, "published": published}
+
+
+# ------------------------------------------------------------
+# Rumore nel testo del post che non scrive l'autore: descrizioni
+# automatiche delle foto (che cambiano tra un controllo e l'altro, da
+# "Nessuna descrizione..." a "Potrebbe essere un'immagine..." appena
+# Facebook le calcola), etichette dell'interfaccia, contatori foto.
+# ------------------------------------------------------------
+ALT_TEXT_RE = re.compile(
+    r"(?:Potrebbe essere )?un'immagine raffigurante\s+([^.]*?)\s*(?:\.|(?=\s\d+\s*€)|(?=\s*Post condiviso)|$)"
+    r"|Potrebbe essere un'immagine\s*\.?"
+    r"|Nessuna descrizione della foto disponibile\.*",
+    re.IGNORECASE,
+)
+DISPLAY_NOISE_RE = re.compile(
+    r"\bPost condiviso\b|\bAltro\s*(?:\.\.\.|…)|(?<!\S)\+\d+(?!\S)|\bMessaggio\s*$",
+    re.IGNORECASE,
+)
+
+
+def split_text_and_photos(description):
+    """Ritorna (testo leggibile senza rumore, lista descrizioni foto)."""
+    photos = []
+    for m in ALT_TEXT_RE.finditer(description):
+        if m.group(1):
+            for p in re.split(r",\s*|\s+e\s+", m.group(1).replace("_", " ")):
+                p = p.strip(" ,.")
+                if p and p.lower() != "testo" and p not in photos:
+                    photos.append(p)
+    text = ALT_TEXT_RE.sub(" ", description)
+    text = DISPLAY_NOISE_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text, photos
+
+
+def normalize_for_compare(text):
+    text = text.lower().replace("_", " ")
+    text = re.sub(r"[^\w€]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def clean_description(body):
     """
     Ripulisce il contenuto vero del post (il "body") rimuovendo:
@@ -355,6 +553,9 @@ def clean_description(body):
         "Vedi altri commenti",
         "Mostra altri commenti",
         "Visualizza commenti precedenti",
+        "Rispondi come",
+        "Scrivi un commento",
+        "Scrivi una risposta",
     ]
     cut_positions = [body.find(m) for m in footer_markers if body.find(m) != -1]
 
@@ -371,13 +572,10 @@ def clean_description(body):
     return body if body else None
 
 
-def contains_keyword(text, keywords):
-    """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
+def find_keywords(text, keywords):
+    """Restituisce tutte le parole chiave trovate nel testo (case-insensitive)."""
     text_lower = text.lower()
-    for keyword in keywords:
-        if keyword.lower() in text_lower:
-            return keyword
-    return None
+    return [k for k in keywords if k and k.lower() in text_lower]
 
 def contains_bad_keyword(text):
     """Restituisce la parola chiave trovata (case-insensitive), oppure None."""
@@ -449,7 +647,7 @@ def get_top_post(driver, group_name, group_url):
     text = clean_facebook_text(raw_text)
 
     header, body = split_header_and_body(text)
-    author = extract_author(header)
+    meta = parse_header_meta(extract_author(header))
 
     description = clean_description(body)
     if description is None:
@@ -457,41 +655,155 @@ def get_top_post(driver, group_name, group_url):
 
     post_url, hrefs = extract_post_url(container)
 
-    id_parts = [group_name]
-    if author:
-        id_parts.append(author)
-    id_parts.append(description)
-    post_id = " | ".join(id_parts)[:1000]
+    return build_post(group_name, group_url, meta, description, post_url, hrefs)
+
+
+def build_post(group_name, group_url, meta, description, post_url=None, hrefs=()):
+    display_text, photos = split_text_and_photos(description)
+    norm_text = normalize_for_compare(display_text) or normalize_for_compare(description)
+
+    # ID usato solo per capire se il post in cima è cambiato dall'ultimo
+    # controllo: niente tempi relativi, contatori o descrizioni foto, che
+    # cambiano anche quando il post è lo stesso.
+    post_id = " | ".join(
+        p for p in (group_name, meta["author"], meta["published"], norm_text[:300]) if p
+    )
 
     return {
         "id": post_id,
-        "author": author,
-        "text": description,
+        "author": meta["author"],
+        "location": meta["location"],
+        "rel_time": meta["rel_time"],
+        "published": meta["published"],
+        "text": description,          # testo completo, usato per le keyword
+        "display_text": display_text,  # testo pulito, mostrato nella notifica
+        "photos": photos,
+        "norm_text": norm_text,
         "url": post_url,
-        "hrefs": hrefs,
+        "hrefs": list(hrefs),
         "group_name": group_name,
         "group_url": group_url,
     }
 
 
-def send_telegram_message(text, chat_id):
+def redact(value):
+    """Toglie il token del bot dai messaggi di errore prima di stamparli nel log."""
+    return str(value).replace(TELEGRAM_BOT_TOKEN, "<TOKEN>")
+
+
+def send_telegram_message(text, chat_id, as_html=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        # l'anteprima di un link Facebook è quasi sempre la pagina di login:
+        # occupa spazio senza aggiungere informazioni
+        "disable_web_page_preview": True,
+    }
+    if as_html:
+        data["parse_mode"] = "HTML"
     try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": False,
-            },
-            timeout=10
-        )
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 400 and as_html:
+            # HTML rifiutato da Telegram: ripiega sul testo semplice
+            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+            return send_telegram_message(plain, chat_id)
         if response.status_code != 200:
-            print(f"  Errore invio Telegram ({chat_id}): {response.status_code} - {response.text}")
+            print(f"  Errore invio Telegram ({chat_id}): {response.status_code} - {redact(response.text)}")
         else:
             print(f"  Messaggio Telegram inviato correttamente a {chat_id}.")
     except Exception as e:
-        print("  Errore invio Telegram:", e)
+        print("  Errore invio Telegram:", redact(e))
+
+
+def _esc(text):
+    return html.escape(text, quote=False)
+
+
+def _highlight(text, keywords):
+    """Escapa il testo per l'HTML di Telegram mettendo in grassetto le keyword."""
+    if not keywords:
+        return _esc(text)
+    pattern = re.compile("|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)), re.IGNORECASE)
+    out, last = [], 0
+    for m in pattern.finditer(text):
+        out.append(_esc(text[last:m.start()]))
+        out.append(f"<b>{_esc(m.group(0))}</b>")
+        last = m.end()
+    out.append(_esc(text[last:]))
+    return "".join(out)
+
+
+def keyword_snippet(text, keyword, before=50, after=110):
+    """Porzione di testo attorno alla prima occorrenza della keyword, tagliata su confini di parola."""
+    pos = text.lower().find(keyword.lower())
+    if pos == -1:
+        return None
+    start = max(0, pos - before)
+    end = min(len(text), pos + len(keyword) + after)
+    if start > 0:
+        space = text.find(" ", start, pos)
+        start = space + 1 if space != -1 else start
+    if end < len(text):
+        space = text.rfind(" ", pos + len(keyword), end)
+        end = space if space != -1 else end
+    snippet = text[start:end].strip()
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(text) else "")
+
+
+TEXT_IN_MESSAGE_MAX = 700
+
+
+def build_alert_message(post, keywords):
+    """
+    La prima riga è quella che compare nell'anteprima della notifica sul
+    telefono: ci mettiamo subito la frase in cui compare la parola chiave,
+    così si capisce di che annuncio si tratta senza aprire la chat.
+    """
+    text = post["display_text"] or post["text"]
+    photos_text = ", ".join(post["photos"])
+
+    snippet, from_photo = None, False
+    for k in keywords:
+        snippet = keyword_snippet(text, k)
+        if snippet:
+            break
+    if not snippet:
+        for k in keywords:
+            snippet = keyword_snippet(photos_text, k)
+            if snippet:
+                from_photo = True
+                break
+    if not snippet:
+        snippet = text[:150] + ("…" if len(text) > 150 else "")
+
+    kw_label = ", ".join(_esc(k) for k in keywords)
+    first_line = f"🔔 <b>{kw_label}</b>: {'📷 ' if from_photo else ''}«{_highlight(snippet, keywords)}»"
+
+    details = []
+    if post["author"]:
+        details.append(f"👤 {_esc(post['author'])}")
+    if post["location"]:
+        details.append(f"📍 {_esc(post['location'])}")
+    if post["rel_time"]:
+        details.append(f"🕒 {_esc(post['rel_time'])}")
+
+    lines = [first_line]
+    if details:
+        lines.append(" · ".join(details))
+    lines.append(f"👥 {_esc(post['group_name'])}")
+
+    body = text if len(text) <= TEXT_IN_MESSAGE_MAX else text[:TEXT_IN_MESSAGE_MAX].rsplit(" ", 1)[0] + "…"
+    if body and body != snippet.strip("…"):
+        lines += ["", _highlight(body, keywords)]
+    if photos_text:
+        lines.append(f"📷 Foto: {_highlight(photos_text[:200], keywords)}")
+
+    link = post["url"] or post["group_url"]
+    if link:
+        label = "Apri il post" if post["url"] else "Apri il gruppo"
+        lines += ["", f'🔗 <a href="{html.escape(link, quote=True)}">{label}</a>']
+    return "\n".join(lines)
 
 
 def process_top_post(top_post, alerted_posts, chats):
@@ -507,47 +819,32 @@ def process_top_post(top_post, alerted_posts, chats):
     matched = False
 
     for chat_id, chat_data in chats.items():
-        keyword = contains_keyword(top_post["text"], chat_data.get("keywords", []))
-        if not keyword:
+        keywords = find_keywords(top_post["text"], chat_data.get("keywords", []))
+        if not keywords:
             continue
 
-        alert_key = f"{chat_id}|{top_post['id']}"
-        if alert_key in alerted_posts:
+        record = make_alert_record(chat_id, top_post)
+        previous = find_previous_alert(record, alerted_posts)
+        if previous:
+            print(f"  Già segnalato a {chat_id} (gruppo {previous.get('group')!r}): salto.")
             continue
 
-        alerted_posts.add(alert_key)
+        alerted_posts.append(record)
         save_alerted_posts(alerted_posts)
         matched = True
 
+        message = build_alert_message(top_post, keywords)
         print()
         print("=" * 60)
-        print(f"🚨 {str(keyword).upper()} 🚨")
         print("Chat:", chat_id)
-        print("Gruppo:", top_post["group_name"])
-        print("Parola:", keyword)
-        if top_post["author"]:
-            print("Autore:", top_post["author"])
-        print("-" * 60)
-        print(top_post["text"][:1000])
+        print(html.unescape(re.sub(r"<[^>]+>", "", message)))
         print("=" * 60)
         print()
 
-        message_lines = [
-            f"🚨 TROVATO: {str(keyword).upper()} 🚨",
-            f"Gruppo: {top_post['group_name']}",
-            f"Parola: {keyword}",
-        ]
-        if top_post["author"]:
-            message_lines.append(f"Autore: {top_post['author']}")
-        message_lines.append("")
-        message_lines.append(top_post["text"][:1000])
-        message_lines.append("")
-        message_lines.append(top_post["url"] or top_post["group_url"])
-
-        send_telegram_message("\n".join(message_lines), chat_id)
+        send_telegram_message(message, chat_id, as_html=True)
 
     if not matched:
-        print("Nessuna keyword trovata!")
+        print("Nessun nuovo annuncio da segnalare.")
 
     return matched
 
@@ -659,9 +956,9 @@ def register_telegram_commands():
     try:
         response = requests.post(url, json={"commands": TELEGRAM_COMMANDS}, timeout=10)
         if response.status_code != 200:
-            print(f"  Errore registrazione comandi Telegram: {response.status_code} - {response.text}")
+            print(f"  Errore registrazione comandi Telegram: {response.status_code} - {redact(response.text)}")
     except Exception as e:
-        print("  Errore registrazione comandi Telegram:", e)
+        print("  Errore registrazione comandi Telegram:", redact(e))
 
 
 def get_telegram_updates(offset):
@@ -674,7 +971,7 @@ def get_telegram_updates(offset):
         response.raise_for_status()
         return response.json().get("result", [])
     except Exception as e:
-        print("  Errore lettura comandi Telegram:", e)
+        print("  Errore lettura comandi Telegram:", redact(e))
         return []
 
 

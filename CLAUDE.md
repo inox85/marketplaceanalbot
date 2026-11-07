@@ -25,7 +25,7 @@ python main.py
 - `bad_keywords.json` — words that suppress an alert even if a keyword also matched (e.g. `"cerco"`, to skip "wanted" posts vs. "giving away" posts).
 - `keywords.json` and `bad_keywords.json` are re-read from disk on every monitoring loop iteration (`reload_keywords()`), so they can be edited live without restarting the bot. `groups.json` is only read once at startup.
 - `alerted_posts.json` — persisted set of post IDs already alerted on, used to avoid duplicate Telegram messages across restarts.
-- `secrets.ini` has a `[telegram]` section with `bot_token`/`chat_id`, but it is currently **not read anywhere** — `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are hardcoded near the top of `main.py` instead. Keep this in mind if credentials need to change: editing `secrets.ini` alone has no effect.
+- `secrets.ini` (`[telegram] bot_token`) holds the bot token. Subscribed chats and their per-chat keywords live in `chats.json` (managed via Telegram commands /subscribe, /add, /remove, /keywords, /clear); `keywords.json` is only the default list given to new subscribers.
 
 ## Architecture: the scraping pipeline (`main.py`)
 
@@ -40,10 +40,10 @@ The core loop (`main()`) opens each group URL in turn, forces chronological sort
    - `clean_description()` — trims the trailing UI footer (Mi piace/Commenta/Condividi), any embedded comment preview (which has its own name + relative-time pattern via `COMMENT_PREVIEW_RE` — relative times like "3 min" change between checks even for an unchanged post, which would otherwise defeat the dedup logic below), and trailing reaction/comment counters.
    
    If you need to adapt this to Facebook DOM/markup changes, the fragility is concentrated in these functions — the CSS selector (`div[aria-posinset="1"]`) and the sort-menu text hints in `select_new_posts()` are the other two spots likely to break first.
-4. **Identify & dedupe**: `post_id` is built as `"<group_name> | <author> | <description>"` (truncated to 1000 chars) — there is no real Facebook post ID extracted for this purpose (though `extract_post_url()` does try to recover a real permalink via regex over the post's `<a>` hrefs, used only for the Telegram message link). Because the ID is text-derived, the cleanup step above matters for stable dedup across cycles.
-5. **Filter & alert**: `process_top_post()` requires a `KEYWORDS` match, requires no `BAD_KEYWORDS` match, and requires the post ID not already be in `alerted_posts` (persisted to `alerted_posts.json` immediately on match, before sending) — then posts to Telegram via `send_telegram_message()`.
+4. **Identify & dedupe**: `parse_header_meta()` splits the header into author / location ("si trova a") / relative time ("2 minuti fa", display only) / absolute publish date ("Venerdì 6 novembre 2026 alle ore 09:06", stable). The relative time must never end up in any ID: it changes every minute and used to cause the same post to be re-alerted repeatedly. `build_post()` produces `display_text` (text minus photo alt-text / UI noise) and `norm_text` (normalized, for comparison).
+5. **Filter & alert**: `process_top_post()` requires a per-chat keyword match (`chats.json`), no shared `BAD_KEYWORDS` match, and no previous alert for the same chat according to `is_duplicate()`: same post URL, or same author + same publish date, or same author + similar text (`texts_match()`: containment or `SequenceMatcher` ≥ 0.85, also across different groups to suppress cross-posts), or no author + same group + similar text. `alerted_posts.json` is a list of structured records (old string entries are migrated on load; records older than 60 days are dropped). The Telegram message (`build_alert_message()`, HTML parse mode) puts the sentence around the keyword on the first line so it shows in the phone's notification preview.
 
-Within one cycle, `last_seen_ids[group_url]` also prevents reprocessing the same top post repeatedly across cycles even when it doesn't match keywords (it's checked before the keyword filter is even consulted).
+`last_seen_ids[group_url]` additionally skips reprocessing an unchanged top post (it's checked before the keyword filter is consulted).
 
 Between full cycles over all groups, the loop sleeps `CHECK_INTERVAL` (30s) seconds, printing a `.` per second as a progress indicator.
 
